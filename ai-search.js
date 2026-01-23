@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Google 搜索 AI 翻译增强
+// @name         Google 搜索 AI 翻译增强-MT版
 // @namespace    http://tampermonkey.net/
 // @version      2.0
 // @description  自动将中文搜索翻译成英文搜索，修复重复翻译/流程错误，支持通义千问 DashScope API 翻译模式
