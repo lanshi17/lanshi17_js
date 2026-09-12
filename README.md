@@ -29,6 +29,12 @@ Tampermonkey(油猴)用户脚本集合。GitHub:https://github.com/lanshi17 有a
 
 ### 安全须知
 - ST 是账号钥匙,明文存在本机 Tampermonkey 存储里(仅本机本浏览器),勿导出分享
+
 - 在 chatgpt.com 执行“登出所有设备”会使所有已存 ST 全部失效
 - ST 过期(约 30 天滚动)后,需在该账号登录状态下点「保存当前账号」重新捕获
 - 本脚本只读写你自己的会话 cookie,不外发任何数据
+
+## 许可证
+
+本项目基于 [MIT License](./LICENSE) 发布(Copyright (c) 2025 胖胖的我)。
+各用户脚本头部均含 `@license MIT` 元数据声明;二次分发请保留许可证与版权声明。
