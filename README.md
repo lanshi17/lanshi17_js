@@ -22,6 +22,8 @@ Tampermonkey(油猴)用户脚本集合。GitHub:https://github.com/lanshi17 有a
 - 「导入」支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可
   (兼容本脚本备份、sub2api、CLIProxyAPI 等导出);仅带 API/OAuth 凭证(无 ST)的账号
   标记「缺ST」,网页切换仍需 ST——登录该账号后点「保存当前账号」即自动合并补齐
+- 缺 ST 的账号行主操作为「复制 Token」:一键复制 access_token / refresh_token,直接用于 API/Codex 侧
+- 「导入」支持选择本地 JSON/TXT 文件(可多选),与粘贴等效
 - 一键切换账号,超长 ST 自动分块写入;切换失败有 toast 提示
 - 「备份」一键导出全部账号 JSON 到剪贴板,导入可批量还原
 - 已保存账号的会话失效时,页面顶部横幅提示并引导处理

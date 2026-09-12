@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.2.0
+// @version      1.3.0
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -35,6 +35,11 @@
  * - 仅带 API/OAuth 凭证(无 ST)的账号也可导入:列表标记「缺ST」,网页切换仍需 ST,
  *       登录该账号后点「保存当前账号」即自动合并补齐
  * - 捕获/导入统一 upsert 合并,保留既有凭证字段;账号可携带 platform/refresh_token/access_token
+ *
+ * v1.3.0
+ * - 缺 ST 的账号行主操作变为「复制 Token」:一键复制 access_token / refresh_token,
+ *       直接用于 API/Codex 侧;有 ST 的账号行仍为「切换」
+ * - 导入支持选择本地 JSON/TXT 文件(可多选),自动读取后按同一逻辑导入
  */
 (function () {
   "use strict";
@@ -195,6 +200,7 @@
   border:1px solid var(--cas-border);border-radius:8px;background:var(--cas-chip);color:var(--cas-fg);
   font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 #cas-import-text:focus{outline:none;border-color:var(--cas-accent)}
+#cas-import-file{display:none}
 #cas-import-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 #cas-launch{position:fixed;right:20px;bottom:20px;z-index:2147483646;width:40px;height:40px;
   border-radius:50%;border:1px solid var(--cas-border);background:var(--cas-bg);color:var(--cas-fg);
@@ -385,6 +391,22 @@
     if (getActive() === name) setActive(null);
   }
 
+  async function copyToken(name) {
+    const acct = getAccounts()[name];
+    if (!acct) { toast("没有这个账号:" + name); return; }
+    const lines = [];
+    if (acct.accessToken) lines.push("access_token: " + acct.accessToken);
+    if (acct.refreshToken) lines.push("refresh_token: " + acct.refreshToken);
+    if (!lines.length) { toast("该账号没有可复制的 token"); return; }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("已复制 " + name + " 的 token(含明文凭证,注意保管)");
+    } catch (e) {
+      prompt("剪贴板不可用,请手动复制:", text);
+    }
+  }
+
   async function exportBackup() {
     const all = getAccounts();
     if (!Object.keys(all).length) { toast("还没有账号可备份"); return; }
@@ -427,12 +449,21 @@
       row.appendChild(badge);
     }
 
-    // 每行固定一个「切换」按钮(含当前账号,重按即重写 cookie + 刷新)
-    const btnSwitch = el("button", "cas-btn", "切换");
-    btnSwitch.dataset.act = "switch";
-    btnSwitch.dataset.name = name;
-    btnSwitch.onclick = () => switchTo(name);
-    row.appendChild(btnSwitch);
+    // 主操作按钮:有 ST → 切换;仅 API/OAuth 凭证 → 复制 Token(网页切换本就不可用)
+    if (acct && acct.st) {
+      const btnSwitch = el("button", "cas-btn", "切换");
+      btnSwitch.dataset.act = "switch";
+      btnSwitch.dataset.name = name;
+      btnSwitch.onclick = () => switchTo(name);
+      row.appendChild(btnSwitch);
+    } else {
+      const btnCopy = el("button", "cas-btn", "复制Token");
+      btnCopy.dataset.act = "copy";
+      btnCopy.dataset.name = name;
+      btnCopy.title = "复制 access_token / refresh_token,可直接用于 API/Codex 侧";
+      btnCopy.onclick = () => copyToken(name);
+      row.appendChild(btnCopy);
+    }
 
     const btnDel = el("button", "cas-btn cas-btn-del", "删除");
     btnDel.dataset.act = "del";
@@ -474,9 +505,11 @@
         '<div id="cas-import-view">' +
           '<textarea id="cas-import-text" placeholder="粘贴会话 JSON 或裸 sessionToken&#10;支持任意结构:账号对象含 sessionToken / refresh_token / access_token 任一字段即可&#10;兼容本脚本「备份」及 sub2api / CLIProxyAPI 等导出(可含多个账号)"></textarea>' +
           '<div id="cas-import-actions">' +
+            '<button id="cas-import-file-btn" class="cas-btn">选择文件…</button>' +
             '<button id="cas-import-ok" class="cas-btn cas-btn-primary">确认导入</button>' +
             '<button id="cas-import-cancel" class="cas-btn">取消</button>' +
           "</div>" +
+          '<input id="cas-import-file" type="file" accept=".json,.txt,application/json,text/plain" multiple>' +
         "</div>" +
         '<div id="cas-foot">' +
           '<button id="cas-capture" class="cas-btn">保存当前账号</button>' +
@@ -511,6 +544,19 @@
     };
     wrap.querySelector("#cas-import").onclick = () => showImport(!importView.classList.contains("is-open"));
     wrap.querySelector("#cas-import-cancel").onclick = () => showImport(false);
+    const fileInput = wrap.querySelector("#cas-import-file");
+    wrap.querySelector("#cas-import-file-btn").onclick = () => fileInput.click();
+    fileInput.onchange = () => {
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = ""; // 清空以便下次可重复选择同一文件
+      if (!files.length) return;
+      let ok = 0;
+      Promise.all(files.map((f) =>
+        f.text()
+          .then((txt) => { const r = importJson(txt); if (r !== null && r !== undefined) ok++; })
+          .catch(() => toast("读取文件失败:" + f.name)),
+      )).then(() => { if (ok) showImport(false); });
+    };
     wrap.querySelector("#cas-import-ok").onclick = () => {
       const r = importJson(wrap.querySelector("#cas-import-text").value);
       if (r !== null && r !== undefined) {
@@ -602,7 +648,7 @@
   // ---------- 测试钩子(仅 __CAS_TEST__ 时暴露) ----------
   if (window.__CAS_TEST__) {
     window.__CAS__ = {
-      importJson, applySwitch, switchTo, captureCurrent, removeAccount, exportBackup,
+      importJson, applySwitch, switchTo, captureCurrent, removeAccount, exportBackup, copyToken, buildRow,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
   }
