@@ -36,5 +36,5 @@ Tampermonkey(油猴)用户脚本集合。GitHub:https://github.com/lanshi17 有a
 
 ## 许可证
 
-本项目基于 [MIT License](./LICENSE) 发布(Copyright (c) 2025 胖胖的我)。
+本项目基于 [MIT License](./LICENSE) 发布(Copyright (c) 2026 lanshi17)。
 各用户脚本头部均含 `@license MIT` 元数据声明;二次分发请保留许可证与版权声明。
