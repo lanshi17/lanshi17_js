@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.1.0
-// @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。
+// @version      1.2.0
+// @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -27,6 +27,14 @@
  * - 逻辑:捕获即标记为当前账号;页面加载时按实际会话校正 active(手动换号后不再显示陈旧标记);
  *        切换/写 cookie 失败可见(toast);会话探测 5s 超时;分块序号解析加 NaN 防御
  * - 新增:备份导出/导入(导入兼容本脚本导出的备份 JSON)
+ *
+ * v1.2.0
+ * - 导入:支持任意结构的 JSON —— 递归扫描,账号对象含 sessionToken / refresh_token /
+ *       access_token 任一凭证字段即可识别(兼容本脚本备份、sub2api、CLIProxyAPI 等导出:
+ *       accounts/auths 数组或映射、单账号对象、多层嵌套均可);同键自动去重合并
+ * - 仅带 API/OAuth 凭证(无 ST)的账号也可导入:列表标记「缺ST」,网页切换仍需 ST,
+ *       登录该账号后点「保存当前账号」即自动合并补齐
+ * - 捕获/导入统一 upsert 合并,保留既有凭证字段;账号可携带 platform/refresh_token/access_token
  */
 (function () {
   "use strict";
@@ -50,6 +58,23 @@
   const getActive = () => store.get("cas_active", null);
   const setActive = (n) => store.set("cas_active", n);
 
+  // 统一按主键合并写入:捕获/导入共用;缺省字段保留旧值(如先导入 API 凭证、后补 ST)
+  function upsertAccount(key, patch) {
+    const all = getAccounts();
+    const prev = all[key] || {};
+    all[key] = {
+      st: patch.st || prev.st || "",
+      refreshToken: patch.refreshToken || prev.refreshToken || "",
+      accessToken: patch.accessToken || prev.accessToken || "",
+      platform: patch.platform || prev.platform || "",
+      email: patch.email || prev.email || "",
+      accountId: patch.accountId || prev.accountId || "",
+      addedAt: prev.addedAt || patch.addedAt || new Date().toISOString(),
+    };
+    putAccounts(all);
+    return all[key];
+  }
+
   // ---------- 工具 ----------
   // 所有动态文案一律走 textContent,杜绝把账号名拼进 HTML(账号名来自外部 JSON)
   const el = (tag, cls, text) => {
@@ -71,6 +96,52 @@
       for (const v of Object.values(obj)) { const r = deepFind(v, key); if (r !== undefined) return r; }
     }
     return undefined;
+  }
+
+  // ---- 通用 JSON 账号提取:任意结构,账号对象含任一必需凭证字段即可识别 ----
+  // 必需凭证字段 = sessionToken(网页 ST)/ refresh_token / access_token 之一
+  const CONTAINER_KEYS = ["accounts", "auths", "items", "list", "data", "result", "payload"];
+
+  function isContainer(o) {
+    for (const k of CONTAINER_KEYS) if (o[k] !== undefined) return true;
+    const vals = Object.values(o);
+    // 全由对象/数组组成的聚合(如备份里 name → account 的映射)不是账号本身
+    return vals.length > 0 && vals.every((v) => v && typeof v === "object");
+  }
+
+  function pickStr(o, keys) {
+    for (const k of keys) {
+      const v = deepFind(o, k);
+      if (typeof v === "string" && v) return v;
+    }
+    return "";
+  }
+
+  // 从单个对象里抠出账号;不是账号(容器/无凭证字段)返回 null
+  function accountFromAny(o, hint) {
+    if (!o || typeof o !== "object" || Array.isArray(o) || isContainer(o)) return null;
+    const st = pickStr(o, ["sessionToken", "session_token", "st"]); // "st" 兼容本脚本备份格式
+    const refreshToken = pickStr(o, ["refresh_token", "refreshToken"]);
+    const accessToken = pickStr(o, ["access_token", "accessToken"]);
+    if (!st && !refreshToken && !accessToken) return null;
+    const email = pickStr(o, ["email"]);
+    const name = typeof o.name === "string" && o.name ? o.name : "";
+    const accountId = pickStr(o, ["account_id", "accountId", "chatgpt_account_id"]);
+    const type = typeof o.type === "string" && o.type ? o.type : "";
+    const platform = (typeof o.platform === "string" && o.platform) ? o.platform : (type !== "oauth" ? type : "");
+    return { st, refreshToken, accessToken, email, name, accountId, platform, addedAt: pickStr(o, ["addedAt"]), hint: hint || "" };
+  }
+
+  // 命中即收、不再下钻(防止把 credentials 再拆成第二个账号);未命中则按键继续找
+  function collectAccounts(node, out, hint) {
+    if (Array.isArray(node)) {
+      for (const v of node) collectAccounts(v, out, "");
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const acct = accountFromAny(node, hint);
+    if (acct) { out.push(acct); return; }
+    for (const [k, v] of Object.entries(node)) collectAccounts(v, out, k);
   }
 
   // ---------- 样式(注入 <style>,不依赖 GM_addStyle) ----------
@@ -105,6 +176,8 @@
 .cas-row.is-active{background:var(--cas-accent-soft)}
 .cas-dot{width:8px;height:8px;border-radius:50%;background:var(--cas-border);flex:none}
 .cas-dot.is-on{background:var(--cas-accent)}
+.cas-badge{flex:none;font-size:10px;line-height:1;padding:3px 6px;border-radius:6px;
+  border:1px solid var(--cas-border);color:var(--cas-muted);background:var(--cas-chip)}
 .cas-row-main{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cas-row.is-active .cas-row-main{color:var(--cas-accent);font-weight:600}
 .cas-btn{border:1px solid var(--cas-border);border-radius:8px;background:var(--cas-bg);color:var(--cas-fg);
@@ -217,30 +290,36 @@
     const email = (sess.user && sess.user.email) || "";
     const accountId = (sess.account && (sess.account.account_id || sess.account.id)) || (sess.user && sess.user.id) || "";
     const name = email || accountId || "acct-" + Date.now();
-    const all = getAccounts();
-    all[name] = {
-      st, email, accountId,
-      addedAt: (all[name] && all[name].addedAt) || new Date().toISOString(),
-    };
-    putAccounts(all);
+    upsertAccount(name, { st, email, accountId }); // 合并保留既有凭证(如先导入的 refresh_token)
     setActive(name); // 捕获的就是当前登录态,直接对齐,避免面板显示陈旧的「当前」
     toast("已保存/更新账号:" + name);
     return name;
   }
 
-  function importBackup(map) {
-    let n = 0;
-    const all = getAccounts();
-    for (const [name, a] of Object.entries(map)) {
-      if (a && a.st) {
-        all[name] = { st: a.st, email: a.email || name, accountId: a.accountId || "", addedAt: a.addedAt || new Date().toISOString() };
-        n++;
-      }
+  function importAccountsJson(parsed) {
+    const found = [];
+    collectAccounts(parsed, found, "");
+    if (!found.length) {
+      toast("JSON 里找不到可导入的账号:账号对象需含 sessionToken / refresh_token / access_token 任一字段");
+      return null;
     }
-    if (!n) { toast("备份里没有可导入的账号"); return null; }
-    putAccounts(all);
+    let n = 0, missingSt = 0;
+    for (const f of found) {
+      const email = f.email ||
+        (f.name && f.name.includes("@") ? f.name : "") ||
+        (f.hint && f.hint.includes("@") ? f.hint : "");
+      // 主键:邮箱 > 名称 > 父级 key(兼容本脚本备份的 name→账号映射)> account_id
+      const key = f.email || f.name || f.hint || f.accountId || "acct-" + Date.now() + "-" + n;
+      upsertAccount(key, {
+        st: f.st, refreshToken: f.refreshToken, accessToken: f.accessToken,
+        platform: f.platform, email, accountId: f.accountId, addedAt: f.addedAt,
+      });
+      if (!f.st) missingSt++;
+      n++;
+    }
+    toast("已导入 " + n + " 个账号" +
+      (missingSt ? "(其中 " + missingSt + " 个缺 ST:网页切换需 ST,登录该账号后点「保存当前账号」补齐)" : ""));
     refreshPanel();
-    toast("已从备份导入 " + n + " 个账号");
     return n;
   }
 
@@ -248,39 +327,24 @@
     text = (text || "").trim();
     if (!text) { toast("内容为空"); return null; }
 
-    let st = "";
-    let parsed = null;
     if (/^[A-Za-z0-9_\-.]{20,}$/.test(text)) {
-      st = text; // 直接粘贴裸 ST
-    } else {
-      try { parsed = JSON.parse(text); } catch (e) { toast("不是合法 JSON,也不是 ST 字符串"); return null; }
-      if (parsed && typeof parsed === "object" && parsed.accounts && typeof parsed.accounts === "object") {
-        return importBackup(parsed.accounts); // 本脚本导出的备份
-      }
-      st = deepFind(parsed, "sessionToken") || deepFind(parsed, "session_token") || "";
+      const name = "acct-" + Date.now();
+      upsertAccount(name, { st: text }); // 直接粘贴裸 ST
+      toast("已导入账号:" + name);
+      refreshPanel();
+      return name;
     }
-    if (!st) {
-      if (parsed && (deepFind(parsed, "refresh_token") || deepFind(parsed, "accessToken") || deepFind(parsed, "access_token"))) {
-        toast("这份 JSON 没有 sessionToken:网页切换需要 ST;refresh_token/accessToken 是 API/Codex 侧凭证,网页用不上");
-      } else {
-        toast("找不到 sessionToken 字段");
-      }
-      return null;
-    }
-    const email = (parsed && parsed.user && parsed.user.email) || deepFind(parsed, "email") || "";
-    const accountId = (parsed && parsed.account && (parsed.account.account_id || parsed.account.id)) || "";
-    const name = email || accountId || "acct-" + Date.now();
-    const all = getAccounts();
-    all[name] = { st, email, accountId, addedAt: (all[name] && all[name].addedAt) || new Date().toISOString() };
-    putAccounts(all);
-    toast("已导入账号:" + name);
-    return name;
+
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (e) { toast("不是合法 JSON,也不是 ST 字符串"); return null; }
+    return importAccountsJson(parsed);
   }
 
   /** 只做 cookie 换装,不刷新页面(测试钩子也用它) */
   async function applySwitch(name) {
     const acct = getAccounts()[name];
-    if (!acct || !acct.st) { toast("没有这个账号:" + name); return false; }
+    if (!acct || (!acct.st && !acct.refreshToken && !acct.accessToken)) { toast("没有这个账号:" + name); return false; }
+    if (!acct.st) { toast("「" + name + "」缺 ST(网页会话凭证),无法切换;请登录该账号后点「保存当前账号」补齐"); return false; }
 
     try {
       // 1) 删除现有会话 cookie(含历史分块,防止旧块残留导致重组损坏)
@@ -352,8 +416,16 @@
     row.appendChild(el("span", "cas-dot" + (isActive ? " is-on" : "")));
 
     const nameEl = el("div", "cas-row-main", name);
-    nameEl.title = name + (acct && acct.addedAt ? " · 保存于 " + acct.addedAt.slice(0, 10) : "");
+    nameEl.title = name +
+      (acct && acct.platform ? " · " + acct.platform : "") +
+      (acct && acct.addedAt ? " · 保存于 " + acct.addedAt.slice(0, 10) : "");
     row.appendChild(nameEl);
+
+    if (acct && !acct.st) {
+      const badge = el("span", "cas-badge", "缺ST"); // 仅有 API/OAuth 凭证、还没捕获网页 ST 的账号
+      badge.title = "仅有 API/OAuth 凭证,网页切换需要 ST;登录该账号后点「保存当前账号」自动补齐";
+      row.appendChild(badge);
+    }
 
     // 每行固定一个「切换」按钮(含当前账号,重按即重写 cookie + 刷新)
     const btnSwitch = el("button", "cas-btn", "切换");
@@ -400,7 +472,7 @@
         "</div>" +
         '<div id="cas-list"></div>' +
         '<div id="cas-import-view">' +
-          '<textarea id="cas-import-text" placeholder="粘贴 会话 JSON 或裸 sessionToken&#10;也支持本脚本「备份」导出的 JSON(可含多个账号)"></textarea>' +
+          '<textarea id="cas-import-text" placeholder="粘贴会话 JSON 或裸 sessionToken&#10;支持任意结构:账号对象含 sessionToken / refresh_token / access_token 任一字段即可&#10;兼容本脚本「备份」及 sub2api / CLIProxyAPI 等导出(可含多个账号)"></textarea>' +
           '<div id="cas-import-actions">' +
             '<button id="cas-import-ok" class="cas-btn cas-btn-primary">确认导入</button>' +
             '<button id="cas-import-cancel" class="cas-btn">取消</button>' +
