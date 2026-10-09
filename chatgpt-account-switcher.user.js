@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.3.0
+// @version      1.4.0
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -36,10 +36,10 @@
  *       登录该账号后点「保存当前账号」即自动合并补齐
  * - 捕获/导入统一 upsert 合并,保留既有凭证字段;账号可携带 platform/refresh_token/access_token
  *
- * v1.3.0
- * - 缺 ST 的账号行主操作变为「复制 Token」:一键复制 access_token / refresh_token,
- *       直接用于 API/Codex 侧;有 ST 的账号行仍为「切换」
- * - 导入支持选择本地 JSON/TXT 文件(可多选),自动读取后按同一逻辑导入
+ * v1.4.0
+ * - 导入后自动更新 ST:当前浏览器登录态若命中导入账号,直接用真实 cookie 覆盖导入的旧 ST
+ * - 启动自愈:ST 滚动续期后页面加载时静默覆盖存量,不再误报过期
+ * - 失效提醒降噪:同一账号只提醒一次,点掉横幅后本轮不再刷屏;登录态恢复后重置
  */
 (function () {
   "use strict";
@@ -281,16 +281,46 @@
     return st.match(new RegExp(".{1," + CHUNK_SIZE + "}", "g")) || [st];
   }
 
-  // ---------- 核心:捕获 / 导入 / 切换 / 备份 ----------
-  async function captureCurrent() {
-    const sess = await fetchSession();
-    if (!sess) { toast("当前未登录,无法捕获账号"); return null; }
+  // 读取当前浏览器里的实际 ST(分块按序重组);读不到返回 ""
+  async function readCurrentSt() {
     const cookies = (await gmList().catch(() => [])).filter(isSessionCookie);
     // 分块(.0/.1/…)按序重组;整 cookie 与分块并存属异常残留,以分块为准
     const chunks = cookies
       .filter((c) => c.name !== COOKIE_BASE)
       .sort((a, b) => numSuffix(a.name) - numSuffix(b.name));
-    const st = (chunks.length ? chunks : cookies).map((c) => c.value).join("");
+    return (chunks.length ? chunks : cookies).map((c) => c.value).join("");
+  }
+  // 登录态对上已存账号且浏览器 ST 与存量不一致时静默覆盖(导入旧快照 / ST 滚动续期自愈)
+  // 返回更新的账号名;未登录/对不上/一致返回 null,不打扰用户
+  async function refreshCurrentSt(candidates) {
+    const sess = await fetchSession();
+    if (!sess) return null;
+    const st = await readCurrentSt();
+    if (!st) return null;
+    const email = (sess.user && sess.user.email) || "";
+    const uid = (sess.user && sess.user.id) || "";
+    const all = getAccounts();
+    const names = (candidates && candidates.length ? candidates : Object.keys(all));
+    for (const n of names) {
+      const acct = all[n];
+      if (!acct) continue;
+      if (n === email || (uid && acct.accountId === uid) || (email && acct.email === email)) {
+        const changed = acct.st !== st;
+        if (changed) upsertAccount(n, { st, email: email || acct.email, accountId: uid || acct.accountId });
+        setActive(n);
+        store.set("cas_invalid", false);
+        return changed ? n : null;
+      }
+    }
+    return null;
+  }
+
+
+  // ---------- 核心:捕获 / 导入 / 切换 / 备份 ----------
+  async function captureCurrent() {
+    const sess = await fetchSession();
+    if (!sess) { toast("当前未登录,无法捕获账号"); return null; }
+    const st = await readCurrentSt();
     if (!st) { toast("未找到会话 cookie(ST)"); return null; }
 
     const email = (sess.user && sess.user.email) || "";
@@ -310,6 +340,7 @@
       return null;
     }
     let n = 0, missingSt = 0;
+    const imported = [];
     for (const f of found) {
       const email = f.email ||
         (f.name && f.name.includes("@") ? f.name : "") ||
@@ -320,9 +351,13 @@
         st: f.st, refreshToken: f.refreshToken, accessToken: f.accessToken,
         platform: f.platform, email, accountId: f.accountId, addedAt: f.addedAt,
       });
+      imported.push(key);
       if (!f.st) missingSt++;
       n++;
     }
+    // 导入后自愈:若当前浏览器登录态正好是其中之一,直接用真实 ST 覆盖导入值
+    // (导入的 ST 常是旧快照/滚动过期,当前 cookie 才是权威;不阻塞导入 toast)
+    refreshCurrentSt(imported);
     toast("已导入 " + n + " 个账号" +
       (missingSt ? "(其中 " + missingSt + " 个缺 ST:网页切换需 ST,登录该账号后点「保存当前账号」补齐)" : ""));
     refreshPanel();
@@ -596,14 +631,15 @@
     const old = document.getElementById("cas-alert");
     if (old) old.remove();
     if (!store.get("cas_invalid", false)) return;
+    const ack = () => store.set("cas_invalid_ack", getActive()); // 点掉后同账号本轮不再刷屏
     const bar = el("div");
     bar.id = "cas-alert";
     bar.appendChild(el("span", "cas-alert-text", "已保存账号的会话已失效(ST 过期或被登出)"));
     const fix = el("button", "cas-btn cas-btn-primary cas-alert-btn", "去处理");
-    fix.onclick = () => { bar.remove(); panel(); };
+    fix.onclick = () => { ack(); bar.remove(); panel(); };
     const dismiss = el("button", "cas-alert-btn", "×");
     dismiss.title = "本次隐藏";
-    dismiss.onclick = () => bar.remove();
+    dismiss.onclick = () => { ack(); bar.remove(); };
     bar.append(fix, dismiss);
     document.documentElement.appendChild(bar);
   }
@@ -619,13 +655,22 @@
       const uid = (sess.user && sess.user.id) || "";
       let match = null;
       for (const n of Object.keys(all)) {
-        if (n === email || (uid && all[n].accountId === uid)) { match = n; break; }
+        if (n === email || (uid && all[n].accountId === uid) || (email && all[n].email === email)) { match = n; break; }
       }
       setActive(match);
       store.set("cas_invalid", false);
+      store.set("cas_invalid_ack", null); // 登录态恢复,下次失效重新提醒
+      // ST 滚动续期/导入旧快照自愈:浏览器 cookie 才是权威,直接覆盖存量,不打扰用户
+      if (match) {
+        const st = await readCurrentSt();
+        if (st && all[match].st !== st) upsertAccount(match, { st });
+      }
     } else if (getActive()) {
       store.set("cas_invalid", true); // 已存账号但 ST 失效
-      toast("⚠️ 当前会话已失效:ST 过期或被登出。请在目标账号登录状态下重新捕获");
+      // 同一失效账号只提醒一次,点掉横幅后本轮不再刷屏;状态变化后恢复提醒
+      if (store.get("cas_invalid_ack") !== getActive()) {
+        toast("⚠️ 当前会话已失效:ST 过期或被登出。请在目标账号登录状态下重新捕获");
+      }
     } else {
       store.set("cas_invalid", false);
     }
@@ -649,6 +694,7 @@
   if (window.__CAS_TEST__) {
     window.__CAS__ = {
       importJson, applySwitch, switchTo, captureCurrent, removeAccount, exportBackup, copyToken, buildRow,
+      refreshCurrentSt, readCurrentSt,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
   }
