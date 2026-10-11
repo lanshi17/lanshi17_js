@@ -887,28 +887,48 @@
       wrap.querySelector("#cas-sub-open").onclick = () => window.open(url, "_blank", "noopener");
       wrap.querySelector("#cas-sub-goto").onclick = () => { location.href = url; }; // 直接跳转到支付页面
     };
-    const runSub = async (country, currency) => {
-      country = String(country || "").trim().toUpperCase();
-      currency = String(currency || "").trim().toUpperCase();
-      if (!/^[A-Z]{2}$/.test(country) || !/^[A-Z]{3}$/.test(currency)) {
-        subStatus.textContent = "国家填 2 位字母(如 PH),币种填 3 位字母(如 PHP)";
+    // OpenAI 对 checkout 生成有风控:连点/短时多次生成、出口 IP 与 billing 国家对不上都可能 400 unusual activity。
+    // 这里做两件事:15s 防连点冷却 + 把风控 400 翻译成可操作的中文建议,不直接甩原始英文。
+    let lastSubAt = 0;
+    const SUB_COOLDOWN_MS = 15000;
+    function subErrMsg(e) {
+      const raw = ((e && e.message) || String(e));
+      if (/unusual activity/i.test(raw)) {
+        return "OpenAI 风控拦截(非脚本 bug):" +
+          "① 别连点——每次生成都会使旧链失效且计入风控;② 出口 IP 尽量与所选国家一致(PH 链最好挂 PH IP);" +
+          "③ 换个区(US 兜底)或过 10–30 分钟再试;④ 急用直接去官网升级页手动订阅。" +
+          "原始返回:" + raw;
+      }
+      return "生成失败:" + raw;
+    }
+     const runSub = async (country, currency) => {
+       country = String(country || "").trim().toUpperCase();
+       currency = String(currency || "").trim().toUpperCase();
+       if (!/^[A-Z]{2}$/.test(country) || !/^[A-Z]{3}$/.test(currency)) {
+         subStatus.textContent = "国家填 2 位字母(如 PH),币种填 3 位字母(如 PHP)";
+         return;
+       }
+      const waitMs = SUB_COOLDOWN_MS - (Date.now() - lastSubAt);
+      if (waitMs > 0) {
+        subStatus.textContent = "点太快了,等 " + Math.ceil(waitMs / 1000) + " 秒再试(防 OpenAI 风控计数)";
         return;
       }
-      setBusy(true);
-      subResult.classList.remove("is-open");
-      subStatus.textContent = "生成中:" + country + "/" + currency + " → checkout → Stripe init 长链…";
-      try {
-        const urls = await generatePlusLink(country, currency, subAccount);
-        const url = urls.external || urls.internal;
-        subStatus.textContent = "已生成(" + country + "/" + currency + ")" +
-          (urls.external ? ":pay.openai.com 长链,干净环境可开" : ":chatgpt.com 内部链,需当前登录态");
-        showResult(url);
-      } catch (e) {
-        subStatus.textContent = "生成失败:" + ((e && e.message) || e);
-      } finally {
-        setBusy(false);
-      }
-    };
+      lastSubAt = Date.now();
+       setBusy(true);
+       subResult.classList.remove("is-open");
+       subStatus.textContent = "生成中:" + country + "/" + currency + " → checkout → Stripe init 长链…";
+       try {
+         const urls = await generatePlusLink(country, currency, subAccount);
+         const url = urls.external || urls.internal;
+         subStatus.textContent = "已生成(" + country + "/" + currency + ")" +
+           (urls.external ? ":pay.openai.com 长链,干净环境可开" : ":chatgpt.com 内部链,需当前登录态");
+         showResult(url);
+       } catch (e) {
+        subStatus.textContent = subErrMsg(e);
+       } finally {
+         setBusy(false);
+       }
+     };
     for (const p of SUB_PRESETS) {
       const b = el("button", "cas-preset" + (p.ph ? " is-ph" : ""), p.label);
       b.title = p.country + "/" + p.currency;
