@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.4.0
-// @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
+// @version      1.5.0
+// @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
 // @license      MIT
@@ -10,6 +10,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      api.stripe.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -40,6 +42,14 @@
  * - 导入后自动更新 ST:当前浏览器登录态若命中导入账号,直接用真实 cookie 覆盖导入的旧 ST
  * - 启动自愈:ST 滚动续期后页面加载时静默覆盖存量,不再误报过期
  * - 失效提醒降噪:同一账号只提醒一次,点掉横幅后本轮不再刷屏;登录态恢复后重置
+ *
+ * v1.5.0(合并上游 1837620622/chatgpt-specimen-toolbox 订阅链路)
+ * - 新增 Plus 订阅支付链:菲律宾 PH/PHP 置顶 + 自定义 country/currency,一次只生成一条(后链使前链失效)
+ * - 长链引擎照抄上游三步法:POST /backend-api/payments/checkout → POST api.stripe.com/v1/payment_pages/{cs}/init
+ *   → host 重写 checkout.stripe.com → pay.openai.com;Stripe init 失败自动回退 checkout 响应直链
+ * - 面板新增「订阅 Plus」视图:常用区快捷按钮 + 结果展示(复制/新标签打开/当前页直跳);行内「订阅」按钮按当前行账号的 accessToken 生成
+ * - GM_xmlhttpRequest 打 Stripe(绕同源,需 @connect api.stripe.com 声明);请求体仅 plan_name/checkout_ui_mode/billing_details/cancel_url,刻意不塞 success_url/entry_point/promo_campaign/locale
+ * - 借用账号已存 accessToken(无则用当前登录态);accessToken 不落盘,仅内存使用,不外发第三方
  */
 (function () {
   "use strict";
@@ -220,6 +230,26 @@
 .cas-toast{background:#202123;color:#fff;padding:9px 13px;border-radius:10px;font-size:13px;
   box-shadow:0 4px 16px rgba(0,0,0,.35);max-width:360px;animation:cas-in .18s ease-out}
 @keyframes cas-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+#cas-sub-view{display:none;padding:10px 12px;border-top:1px solid var(--cas-border)}
+#cas-sub-view.is-open{display:block}
+#cas-sub-view .cas-sub-title{font-weight:700;font-size:13px;margin-bottom:2px}
+#cas-sub-view .cas-sub-tip{color:var(--cas-muted);font-size:11.5px;line-height:1.6;margin-bottom:8px}
+#cas-sub-view .cas-sub-tip b{color:var(--cas-accent)}
+.cas-presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.cas-preset{border:1px solid var(--cas-border);border-radius:8px;background:var(--cas-bg);color:var(--cas-fg);
+  padding:4px 10px;font-size:12px;cursor:pointer;font-family:inherit}
+.cas-preset:hover{background:var(--cas-chip)}
+.cas-preset.is-ph{border-color:var(--cas-accent);background:var(--cas-accent-soft);font-weight:700}
+.cas-preset:disabled{opacity:.5;cursor:wait}
+.cas-sub-custom{display:flex;gap:6px;margin-bottom:8px}
+.cas-sub-custom input{flex:1;min-width:0;padding:5px 8px;border:1px solid var(--cas-border);border-radius:8px;
+  background:var(--cas-chip);color:var(--cas-fg);font:12px/1.5 inherit}
+.cas-sub-custom input:focus{outline:none;border-color:var(--cas-accent)}
+#cas-sub-status{font-size:12px;color:var(--cas-muted);min-height:18px;margin-bottom:6px;word-break:break-all}
+#cas-sub-result{display:none;flex-direction:column;gap:6px}
+#cas-sub-result.is-open{display:flex}
+#cas-sub-link{font-size:11.5px;word-break:break-all;color:var(--cas-accent);max-height:54px;overflow-y:auto}
+#cas-sub-actions{display:flex;gap:6px;justify-content:flex-end}
 `;
 
   function injectStyle() {
@@ -456,6 +486,207 @@
       prompt("剪贴板不可用,请手动复制备份 JSON(含明文 ST):", payload);
     }
   }
+  // ---------- Plus 订阅支付链(合并自 1837620622/chatgpt-specimen-toolbox) ----------
+  // 三步长链:1) POST /backend-api/payments/checkout → cs_id + publishable_key
+  //          2) POST api.stripe.com/v1/payment_pages/{cs}/init → stripe_hosted_url(带权威 #fid)
+  //          3) host 重写 checkout.stripe.com → pay.openai.com → 最终长链
+  // 请求体只带 4 个字段,success_url/entry_point/promo_campaign/locale 一律不塞(上游黑名单)。
+  // 一次只生成一条:后生成的 checkout 会使先前链接失效。
+  const CHECKOUT_URL = "/backend-api/payments/checkout";
+  const CANCEL_URL = "https://chatgpt.com/#pricing";
+  // OpenAI 嵌在 checkout JS 里的公开 live publishable key,仅响应没带 pk 时兜底
+  const DEFAULT_STRIPE_PK = "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n";
+  const STRIPE_API_VERSION = "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1";
+  const STRIPE_INIT_BASE = "https://api.stripe.com/v1/payment_pages/";
+  // 菲律宾置顶;其余为常用兜底。country 只影响支付页币种/默认支付方式,不决定试用资格(看出口 IP)
+  const SUB_PRESETS = [
+    { label: "🇵🇭 菲律宾 · PHP", country: "PH", currency: "PHP", ph: true },
+    { label: "德国 · EUR", country: "DE", currency: "EUR" },
+    { label: "法国 · EUR", country: "FR", currency: "EUR" },
+    { label: "英国 · GBP", country: "GB", currency: "GBP" },
+    { label: "日本 · JPY", country: "JP", currency: "JPY" },
+    { label: "美国 · USD", country: "US", currency: "USD" },
+  ];
+
+  // merchant_path 推断:openai_ie → 爱尔兰主体(欧亚多数国家);其他 → 美国 LLC
+  function inferMerchantPath(country) {
+    const c = String(country || "").toUpperCase();
+    const ie = ["DE", "FR", "IT", "ES", "NL", "BE", "AT", "PT", "IE", "LU", "FI", "GR", "CY",
+      "EE", "LV", "LT", "MT", "SK", "SI", "GB", "PH", "JP", "SG", "MY", "TH", "ID", "VN"];
+    return ie.indexOf(c) >= 0 ? "openai_ie" : "openai_llc";
+  }
+
+  function fragmentFromClientSecret(clientSecret, sessionId) {
+    if (!clientSecret || !sessionId) return "";
+    const marker = sessionId + "_secret_";
+    const idx = clientSecret.indexOf(marker);
+    if (idx < 0) return "";
+    const frag = clientSecret.slice(idx + marker.length);
+    return frag ? "#" + frag : "";
+  }
+
+  function extractSessionIdFromAnyUrl(data) {
+    if (!data) return "";
+    const cands = [data.checkout_url, data.url, data.openai_checkout_url];
+    for (const u of cands) {
+      if (typeof u !== "string" || !u) continue;
+      const m = u.match(/(cs_(?:live|test)_[A-Za-z0-9]+)/);
+      if (m) return m[1];
+    }
+    return "";
+  }
+
+  function extractEntityFromAnyUrl(data) {
+    if (!data) return "";
+    const cands = [data.checkout_url, data.url, data.openai_checkout_url];
+    for (const u of cands) {
+      if (typeof u !== "string" || !u) continue;
+      const m = u.match(/\/checkout\/([^/]+)\/cs_(?:live|test)_/);
+      if (m) return m[1];
+    }
+    return "";
+  }
+
+  // hosted 响应 → 外部 Stripe 长链(pay.openai.com,干净环境可开)+ 内部 wrapper(chatgpt.com,需当前登录态)
+  function buildBothCheckoutUrls(data, country) {
+    if (!data) return { external: "", internal: "" };
+    const sid = (data.checkout_session_id || "").trim() || extractSessionIdFromAnyUrl(data);
+    let external = (typeof data.url === "string" && data.url) ? data.url : "";
+    if (!external && sid) {
+      const frag = fragmentFromClientSecret(data.client_secret, sid);
+      if (frag) external = "https://pay.openai.com/c/pay/" + sid + frag;
+    }
+    const entity = (data.processor_entity || "").trim() || extractEntityFromAnyUrl(data) || inferMerchantPath(country);
+    const internal = sid
+      ? (entity ? "https://chatgpt.com/checkout/" + entity + "/" + sid : "https://chatgpt.com/checkout/" + sid)
+      : "";
+    return { external: external, internal: internal };
+  }
+
+  function buildStripeInitBody(pk) {
+    const jsId = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : (Date.now().toString(16) + Math.random().toString(16).slice(2));
+    const p = new URLSearchParams();
+    p.set("browser_locale", "en-US");
+    p.set("elements_session_client[client_betas][0]", "custom_checkout_server_updates_1");
+    p.set("elements_session_client[client_betas][1]", "custom_checkout_manual_approval_1");
+    p.set("elements_session_client[elements_init_source]", "custom_checkout");
+    p.set("elements_session_client[referrer_host]", "chatgpt.com");
+    p.set("elements_session_client[stripe_js_id]", jsId);
+    p.set("elements_session_client[locale]", "en");
+    p.set("elements_session_client[is_aggregation_expected]", "false");
+    p.set("elements_options_client[saved_payment_method][enable_save]", "auto");
+    p.set("elements_options_client[saved_payment_method][enable_redisplay]", "auto");
+    p.set("key", pk);
+    p.set("_stripe_version", STRIPE_API_VERSION);
+    return p.toString();
+  }
+
+  // 跨域打 Stripe:优先 GM_xmlhttpRequest(无视同源,需头部 @connect api.stripe.com);
+  // 无 GM 时降级 fetch(大概率 CORS 失败 → 调用方回退 checkout 直链,不致命)。
+  // URL 白名单:仅允许 payment_pages init,防页面 XSS 借通道打任意域。
+  function stripeFetch(url, headers, body) {
+    return new Promise((resolve, reject) => {
+      if (typeof url !== "string" || url.indexOf(STRIPE_INIT_BASE) !== 0 || !/\/init$/.test(url)) {
+        reject(new Error("拒绝:非法 Stripe init URL"));
+        return;
+      }
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "POST", url: url, headers: headers, data: body, timeout: 15000,
+          onload: (res) => resolve({ status: res.status, text: res.responseText }),
+          onerror: () => reject(new Error("Stripe init 请求失败(网络异常)")),
+          ontimeout: () => reject(new Error("Stripe init 请求超时")),
+        });
+        return;
+      }
+      fetch(url, { method: "POST", headers: headers, body: body })
+        .then((r) => r.text().then((t) => ({ status: r.status, text: t })))
+        .then(resolve, reject);
+    });
+  }
+
+  async function stripeInit(csId, pk) {
+    const url = STRIPE_INIT_BASE + encodeURIComponent(csId) + "/init";
+    const headers = {
+      "Authorization": "Bearer " + pk,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    };
+    const res = await stripeFetch(url, headers, buildStripeInitBody(pk));
+    let data = {};
+    try { data = JSON.parse(res.text); } catch (e) { /* 非 JSON 则走失败分支 */ }
+    if (res.status !== 200) throw new Error("Stripe init 失败 HTTP " + res.status);
+    return data;
+  }
+
+  // checkout 响应 → 长链;Stripe init 失败不致命,回退旧版直链(至少不比 checkout 原生差)
+  async function buildLongLinkUrls(data, country) {
+    const base = buildBothCheckoutUrls(data, country);
+    const sid = (data && (data.checkout_session_id || "").trim()) || extractSessionIdFromAnyUrl(data);
+    if (!sid) return base;
+    const pk = (data && (data.publishable_key || "").trim()) || DEFAULT_STRIPE_PK;
+    try {
+      const sd = await stripeInit(sid, pk);
+      let hosted = sd.stripe_hosted_url || sd.hosted_url || sd.url || "";
+      if (!hosted) {
+        const frag = fragmentFromClientSecret(data.client_secret, sid);
+        if (frag) hosted = "https://checkout.stripe.com/c/pay/" + sid + frag;
+      }
+      if (!hosted) return base;
+      const external = hosted.indexOf("checkout.stripe.com") >= 0
+        ? hosted.replace("checkout.stripe.com", "pay.openai.com") : hosted;
+      return { external: external || base.external, internal: base.internal };
+    } catch (e) {
+      return base;
+    }
+  }
+
+  async function postCheckout(body, accessToken) {
+    const r = await fetch(CHECKOUT_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + accessToken,
+        "Content-Type": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch (e) { /* 非 JSON 则走失败分支 */ }
+    if (!r.ok) throw new Error("checkout 失败 HTTP " + r.status + ":" + text.slice(0, 300));
+    return data;
+  }
+
+  // 取 accessToken(仅内存,不落盘):指定账号有存货先用它(可给非当前登录账号生成);
+  // 否则用当前浏览器登录态。
+  async function resolveSubToken(preferName) {
+    if (preferName) {
+      const acct = getAccounts()[preferName];
+      if (acct && acct.accessToken) return acct.accessToken;
+    }
+    const sess = await fetchSession();
+    const t = sess && sess.accessToken;
+    if (!t) throw new Error("没有拿到 accessToken:当前未登录,且所选账号未存 access_token(导入含 access_token 的 JSON 或先登录保存)");
+    return t;
+  }
+
+  async function generatePlusLink(country, currency, preferName) {
+    const token = await resolveSubToken(preferName);
+    const data = await postCheckout({
+      plan_name: "chatgptplusplan",
+      checkout_ui_mode: "hosted",
+      billing_details: { country: country, currency: currency },
+      cancel_url: CANCEL_URL,
+    }, token);
+    const urls = await buildLongLinkUrls(data, country);
+    if (!urls.external && !urls.internal) {
+      throw new Error("响应里没有有效的链接。响应字段:" + Object.keys(data || {}).join(","));
+    }
+    return urls; // { external, internal }
+  }
 
   // ---------- UI:面板 ----------
   function escClose(e) {
@@ -499,7 +730,13 @@
       btnCopy.onclick = () => copyToken(name);
       row.appendChild(btnCopy);
     }
-
+    // 该行账号的 accessToken(有存货则用它)生成 Plus 支付链;无存货则回退当前登录态
+    const btnSub = el("button", "cas-btn", "订阅");
+    btnSub.dataset.act = "sub";
+    btnSub.dataset.name = name;
+    btnSub.title = "用该账号生成 Plus 订阅支付链(默认菲律宾 PHP,直达 pay.openai.com 长链)";
+    btnSub.onclick = () => panel({ sub: true, subAccount: name });
+    row.appendChild(btnSub);
     const btnDel = el("button", "cas-btn cas-btn-del", "删除");
     btnDel.dataset.act = "del";
     btnDel.dataset.name = name;
@@ -546,12 +783,30 @@
           "</div>" +
           '<input id="cas-import-file" type="file" accept=".json,.txt,application/json,text/plain" multiple>' +
         "</div>" +
+        '<div id="cas-sub-view">' +
+          '<div class="cas-sub-title">Plus 订阅支付链</div>' +
+          '<div class="cas-sub-tip" id="cas-sub-tip"></div>' +
+          '<div class="cas-presets" id="cas-sub-presets"></div>' +
+          '<div class="cas-sub-custom">' +
+            '<input id="cas-sub-country" maxlength="2" placeholder="国家 PH" title="ISO 3166-1 两位国家码">' +
+            '<input id="cas-sub-currency" maxlength="3" placeholder="币种 PHP" title="ISO 4217 三位币种码">' +
+            '<button id="cas-sub-custom-ok" class="cas-btn">生成</button>' +
+          "</div>" +
+          '<div id="cas-sub-status"></div>' +
+          '<div id="cas-sub-result"><div id="cas-sub-link"></div>' +
+          '<div id="cas-sub-actions">' +
+            '<button id="cas-sub-copy" class="cas-btn">复制链接</button>' +
+            '<button id="cas-sub-open" class="cas-btn">新标签打开</button>' +
+            '<button id="cas-sub-goto" class="cas-btn cas-btn-primary">直接跳转支付</button>' +
+          "</div></div>" +
+        "</div>" +
         '<div id="cas-foot">' +
           '<button id="cas-capture" class="cas-btn">保存当前账号</button>' +
           '<button id="cas-import" class="cas-btn">导入</button>' +
           '<button id="cas-export" class="cas-btn">备份</button>' +
-        "</div>" +
-      "</div>";
+          '<button id="cas-sub" class="cas-btn cas-btn-primary">订阅 Plus</button>' +
+         "</div>" +
+       "</div>";
     document.documentElement.appendChild(wrap);
 
     const all = getAccounts();
@@ -601,6 +856,74 @@
       }
     };
     if (opts && opts.import) showImport(true);
+
+    // ---- 订阅视图:预设区按钮 + 自定义 country/currency + 结果三连(复制/新标签/直跳) ----
+    const subView = wrap.querySelector("#cas-sub-view");
+    const subTip = wrap.querySelector("#cas-sub-tip");
+    const subPresets = wrap.querySelector("#cas-sub-presets");
+    const subStatus = wrap.querySelector("#cas-sub-status");
+    const subResult = wrap.querySelector("#cas-sub-result");
+    const subLink = wrap.querySelector("#cas-sub-link");
+    const subAccount = (opts && opts.subAccount) || getActive() || "";
+    const subAcct = subAccount ? getAccounts()[subAccount] : null;
+    const hasToken = !!(subAcct && subAcct.accessToken);
+    // 文案走 textContent(账号名来自外部 JSON,不能拼 HTML)
+    subTip.textContent = "目标账号:" + (subAccount || "(当前登录态)") +
+      (hasToken ? "(用已存 access_token)" : "(用当前登录态)") +
+      " · 一次只生成一条,新链会使旧链失效 · 菲律宾 PH/PHP 置顶";
+    const setBusy = (busy) => {
+      subPresets.querySelectorAll("button").forEach((b) => { b.disabled = busy; });
+      wrap.querySelector("#cas-sub-custom-ok").disabled = busy;
+    };
+    const showResult = (url) => {
+      subLink.textContent = url;
+      subResult.classList.add("is-open");
+      wrap.querySelector("#cas-sub-copy").onclick = () => {
+        navigator.clipboard.writeText(url).then(
+          () => toast("支付链已复制"),
+          () => prompt("剪贴板不可用,请手动复制:", url),
+        );
+      };
+      wrap.querySelector("#cas-sub-open").onclick = () => window.open(url, "_blank", "noopener");
+      wrap.querySelector("#cas-sub-goto").onclick = () => { location.href = url; }; // 直接跳转到支付页面
+    };
+    const runSub = async (country, currency) => {
+      country = String(country || "").trim().toUpperCase();
+      currency = String(currency || "").trim().toUpperCase();
+      if (!/^[A-Z]{2}$/.test(country) || !/^[A-Z]{3}$/.test(currency)) {
+        subStatus.textContent = "国家填 2 位字母(如 PH),币种填 3 位字母(如 PHP)";
+        return;
+      }
+      setBusy(true);
+      subResult.classList.remove("is-open");
+      subStatus.textContent = "生成中:" + country + "/" + currency + " → checkout → Stripe init 长链…";
+      try {
+        const urls = await generatePlusLink(country, currency, subAccount);
+        const url = urls.external || urls.internal;
+        subStatus.textContent = "已生成(" + country + "/" + currency + ")" +
+          (urls.external ? ":pay.openai.com 长链,干净环境可开" : ":chatgpt.com 内部链,需当前登录态");
+        showResult(url);
+      } catch (e) {
+        subStatus.textContent = "生成失败:" + ((e && e.message) || e);
+      } finally {
+        setBusy(false);
+      }
+    };
+    for (const p of SUB_PRESETS) {
+      const b = el("button", "cas-preset" + (p.ph ? " is-ph" : ""), p.label);
+      b.title = p.country + "/" + p.currency;
+      b.onclick = () => runSub(p.country, p.currency);
+      subPresets.appendChild(b);
+    }
+    wrap.querySelector("#cas-sub-custom-ok").onclick = () =>
+      runSub(wrap.querySelector("#cas-sub-country").value, wrap.querySelector("#cas-sub-currency").value);
+    const showSub = (show) => subView.classList.toggle("is-open", show);
+    wrap.querySelector("#cas-sub").onclick = () => showSub(!subView.classList.contains("is-open"));
+    // 行内「订阅」点进来:直接展开;是菲律宾偏好则一步直达生成,免二次点击
+    if (opts && opts.sub) {
+      showSub(true);
+      if (store.get("cas_sub_ph_auto", true)) runSub("PH", "PHP");
+    }
 
     document.addEventListener("keydown", escClose);
     return wrap;
@@ -681,10 +1004,15 @@
       GM_registerMenuCommand("👤 保存当前登录账号", () => captureCurrent().then(refreshPanel));
       GM_registerMenuCommand("📥 导入账号(JSON / ST)", () => panel({ import: true }));
       GM_registerMenuCommand("📤 导出备份(复制 JSON)", exportBackup);
+      GM_registerMenuCommand("💳 订阅 Plus(菲律宾 PHP 一键直达)", () => panel({ sub: true }));
       GM_registerMenuCommand("🫥 显示/隐藏悬浮球", () => {
         store.set("cas_hide_launcher", !store.get("cas_hide_launcher", false));
         launcher();
         toast(store.get("cas_hide_launcher", false) ? "悬浮球已隐藏(菜单可重新开启)" : "悬浮球已显示");
+      });
+      GM_registerMenuCommand("🇵🇭 开/关行内订阅自动直连(PH/PHP)", () => {
+        store.set("cas_sub_ph_auto", !store.get("cas_sub_ph_auto", true));
+        toast(store.get("cas_sub_ph_auto", true) ? "行内「订阅」点开即自动生成 PH/PHP" : "行内「订阅」点开后手动选区");
       });
     }
   }
@@ -695,6 +1023,8 @@
     window.__CAS__ = {
       importJson, applySwitch, switchTo, captureCurrent, removeAccount, exportBackup, copyToken, buildRow,
       refreshCurrentSt, readCurrentSt,
+      generatePlusLink, buildBothCheckoutUrls, buildLongLinkUrls, inferMerchantPath,
+      fragmentFromClientSecret, extractSessionIdFromAnyUrl, SUB_PRESETS,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
   }
