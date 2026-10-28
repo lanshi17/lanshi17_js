@@ -53,9 +53,8 @@
  *
  * v1.6.0(同步 /api/auth/session 新字段)
  * - session 新增顶层 account{id(工作区UUID),planType,structure,residencyRegion} 与
- *   statsigContext{locale,country,deviceId};新增 parseSession 统一归一化,旧结构/旧备份照常解析
- * - 修复账号匹配:新捕获的 accountId 是 account.id 工作区 UUID,不再误存 user.id;
- *   匹配兼容新旧两种(UUID 与 user-xxx 都认),旧记录无需迁移
+ *   statsigContext{locale,country,deviceId};parseSession 只认新结构
+ * - 账号匹配:accountId 用 account.id 工作区 UUID;按 email 或 UUID 命中
  * - 捕获/续期顺带落库 planType/name;列表非 free 账号显示套餐徽标(PLUS/PRO)
  */
 (function () {
@@ -297,36 +296,27 @@
     }
   }
 
-  // 2026 新 session 结构:顶层新增 account{id(工作区UUID),planType,structure,residencyRegion}
-  // 与 statsigContext{locale,country,deviceId};user.id 是 user-xxx 账号标识,与 account.id 不同。
-  // 统一在这里归一化,其余代码不再直接摸 raw 字段;缺字段时回退旧结构,老快照照样能解析。
+  // session 结构:account{id(工作区UUID),planType,structure,residencyRegion} +
+  // statsigContext{locale,country,deviceId};user.id 是 user-xxx,与 account.id 不同。
   function parseSession(sess) {
-    if (!sess) return null;
-    const a = sess.account || {};
-    const u = sess.user || {};
+    if (!sess || !sess.account || !sess.user) return null;
     const sg = sess.statsigContext || {};
     return {
-      email: u.email || sess.email || "",
-      name: u.name || a.name || "",
-      accountId: a.id || a.account_id || "", // 工作区 UUID(新捕获以此为准)
-      userId: u.id || sess.user_id || "", // user-xxx(旧备份里 accountId 存的是它,匹配要兼容)
-      planType: a.planType || sess.planType || "",
-      structure: a.structure || "",
-      residencyRegion: a.residencyRegion || "",
+      email: sess.user.email,
+      name: sess.user.name,
+      accountId: sess.account.id,
+      userId: sess.user.id,
+      planType: sess.account.planType,
+      structure: sess.account.structure,
+      residencyRegion: sess.account.residencyRegion,
       expires: sess.expires || "",
       locale: sg.locale || "",
       country: sg.country || "",
       deviceId: sg.deviceId || "",
-      raw: sess,
     };
   }
-  // 已存记录的 accountId 可能是新工作区 UUID 或旧 user-xxx,两者都算命中
   function sessionMatchesAcct(p, acct) {
-    return !!p.email && (
-      p.email === acct.email ||
-      (p.accountId && acct.accountId === p.accountId) ||
-      (p.userId && acct.accountId === p.userId)
-    );
+    return p.email === acct.email || p.accountId === acct.accountId;
   }
 
   const gmList = () =>
@@ -398,11 +388,11 @@
     if (!st) { toast("未找到会话 cookie(ST)"); return null; }
 
     const p = parseSession(sess);
-    const key = p.email || p.accountId || p.userId || "acct-" + Date.now();
+    const key = p.email;
     // accountId 存新工作区 UUID;planType/name 落库,列表显示套餐徽标
     upsertAccount(key, {
       st, email: p.email, name: p.name,
-      accountId: p.accountId || p.userId, planType: p.planType,
+      accountId: p.accountId, planType: p.planType,
     });
     setActive(key); // 捕获的就是当前登录态,直接对齐,避免面板显示陈旧的「当前」
     toast("已保存/更新账号:" + key);
