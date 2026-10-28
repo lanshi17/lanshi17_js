@@ -56,6 +56,10 @@
  *   statsigContext{locale,country,deviceId};parseSession 只认新结构
  * - 账号匹配:accountId 用 account.id 工作区 UUID;按 email 或 UUID 命中
  * - 捕获/续期顺带落库 planType/name;列表非 free 账号显示套餐徽标(PLUS/PRO)
+ *
+ * v1.6.1
+ * - 导入容错:整体解析失败时截取 JSON 子串/逐行重试,粘贴内容前后混入杂字符不再误判
+ * - toast 去重:相同消息连点不堆叠,只刷新计时
  */
 (function () {
   "use strict";
@@ -276,9 +280,11 @@
       host.id = "cas-toasts";
       document.documentElement.appendChild(host);
     }
-    const t = el("div", "cas-toast", msg);
-    host.appendChild(t);
-    setTimeout(() => t.remove(), ms || 3000);
+    // 同样的报错(如连点「确认导入」)不堆叠,已在屏上就刷新计时
+    for (const old of host.children) {
+      if (old.textContent === msg) { clearTimeout(old._casTimer); old._casTimer = setTimeout(() => old.remove(), ms || 3000); return; }
+    }
+    t._casTimer = setTimeout(() => t.remove(), ms || 3000);
   }
 
   // ---------- 会话 / GM_cookie Promise 封装 ----------
@@ -444,7 +450,23 @@
     }
 
     let parsed = null;
-    try { parsed = JSON.parse(text); } catch (e) { toast("不是合法 JSON,也不是 ST 字符串"); return null; }
+    // 直接解析;失败降级:截首个 { 到末尾 } 的子串,再逐行试
+    // (复制 session 常混入尾巴杂字符,整段 JSON.parse 会直接判死)
+    const slice = (s) => {
+      const i = s.indexOf("{"), j = s.lastIndexOf("}");
+      return i >= 0 && j > i ? JSON.parse(s.slice(i, j + 1)) : null;
+    };
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      try { parsed = slice(text); }
+      catch (e2) {
+        for (const line of text.split(/\r?\n/)) {
+          try { parsed = slice(line) || JSON.parse(line); if (parsed) break; } catch (e3) {}
+        }
+      }
+      if (!parsed) { toast("不是合法 JSON,也不是 ST 字符串"); return null; }
+    }
     return importAccountsJson(parsed);
   }
 
