@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.5.0
+// @version      1.6.0
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -50,6 +50,13 @@
  * - 面板新增「订阅 Plus」视图:常用区快捷按钮 + 结果展示(复制/新标签打开/当前页直跳);行内「订阅」按钮按当前行账号的 accessToken 生成
  * - GM_xmlhttpRequest 打 Stripe(绕同源,需 @connect api.stripe.com 声明);请求体仅 plan_name/checkout_ui_mode/billing_details/cancel_url,刻意不塞 success_url/entry_point/promo_campaign/locale
  * - 借用账号已存 accessToken(无则用当前登录态);accessToken 不落盘,仅内存使用,不外发第三方
+ *
+ * v1.6.0(同步 /api/auth/session 新字段)
+ * - session 新增顶层 account{id(工作区UUID),planType,structure,residencyRegion} 与
+ *   statsigContext{locale,country,deviceId};新增 parseSession 统一归一化,旧结构/旧备份照常解析
+ * - 修复账号匹配:新捕获的 accountId 是 account.id 工作区 UUID,不再误存 user.id;
+ *   匹配兼容新旧两种(UUID 与 user-xxx 都认),旧记录无需迁移
+ * - 捕获/续期顺带落库 planType/name;列表非 free 账号显示套餐徽标(PLUS/PRO)
  */
 (function () {
   "use strict";
@@ -83,7 +90,9 @@
       accessToken: patch.accessToken || prev.accessToken || "",
       platform: patch.platform || prev.platform || "",
       email: patch.email || prev.email || "",
+      name: patch.name || prev.name || "",
       accountId: patch.accountId || prev.accountId || "",
+      planType: patch.planType || prev.planType || "",
       addedAt: prev.addedAt || patch.addedAt || new Date().toISOString(),
     };
     putAccounts(all);
@@ -193,6 +202,7 @@
 .cas-dot.is-on{background:var(--cas-accent)}
 .cas-badge{flex:none;font-size:10px;line-height:1;padding:3px 6px;border-radius:6px;
   border:1px solid var(--cas-border);color:var(--cas-muted);background:var(--cas-chip)}
+.cas-badge-plan{color:var(--cas-accent);border-color:var(--cas-accent);background:transparent}
 .cas-row-main{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cas-row.is-active .cas-row-main{color:var(--cas-accent);font-weight:600}
 .cas-btn{border:1px solid var(--cas-border);border-radius:8px;background:var(--cas-bg);color:var(--cas-fg);
@@ -287,6 +297,38 @@
     }
   }
 
+  // 2026 新 session 结构:顶层新增 account{id(工作区UUID),planType,structure,residencyRegion}
+  // 与 statsigContext{locale,country,deviceId};user.id 是 user-xxx 账号标识,与 account.id 不同。
+  // 统一在这里归一化,其余代码不再直接摸 raw 字段;缺字段时回退旧结构,老快照照样能解析。
+  function parseSession(sess) {
+    if (!sess) return null;
+    const a = sess.account || {};
+    const u = sess.user || {};
+    const sg = sess.statsigContext || {};
+    return {
+      email: u.email || sess.email || "",
+      name: u.name || a.name || "",
+      accountId: a.id || a.account_id || "", // 工作区 UUID(新捕获以此为准)
+      userId: u.id || sess.user_id || "", // user-xxx(旧备份里 accountId 存的是它,匹配要兼容)
+      planType: a.planType || sess.planType || "",
+      structure: a.structure || "",
+      residencyRegion: a.residencyRegion || "",
+      expires: sess.expires || "",
+      locale: sg.locale || "",
+      country: sg.country || "",
+      deviceId: sg.deviceId || "",
+      raw: sess,
+    };
+  }
+  // 已存记录的 accountId 可能是新工作区 UUID 或旧 user-xxx,两者都算命中
+  function sessionMatchesAcct(p, acct) {
+    return !!p.email && (
+      p.email === acct.email ||
+      (p.accountId && acct.accountId === p.accountId) ||
+      (p.userId && acct.accountId === p.userId)
+    );
+  }
+
   const gmList = () =>
     new Promise((res, rej) =>
       GM_cookie.list({}, (cookies, err) => (err ? rej(err) : res(cookies || []))));
@@ -327,16 +369,18 @@
     if (!sess) return null;
     const st = await readCurrentSt();
     if (!st) return null;
-    const email = (sess.user && sess.user.email) || "";
-    const uid = (sess.user && sess.user.id) || "";
+    const p = parseSession(sess);
     const all = getAccounts();
     const names = (candidates && candidates.length ? candidates : Object.keys(all));
     for (const n of names) {
       const acct = all[n];
       if (!acct) continue;
-      if (n === email || (uid && acct.accountId === uid) || (email && acct.email === email)) {
+      if (n === p.email || sessionMatchesAcct(p, acct)) {
         const changed = acct.st !== st;
-        if (changed) upsertAccount(n, { st, email: email || acct.email, accountId: uid || acct.accountId });
+        if (changed) upsertAccount(n, {
+          st, email: p.email || acct.email, name: p.name || acct.name,
+          accountId: p.accountId || acct.accountId, planType: p.planType || acct.planType,
+        });
         setActive(n);
         store.set("cas_invalid", false);
         return changed ? n : null;
@@ -353,13 +397,16 @@
     const st = await readCurrentSt();
     if (!st) { toast("未找到会话 cookie(ST)"); return null; }
 
-    const email = (sess.user && sess.user.email) || "";
-    const accountId = (sess.account && (sess.account.account_id || sess.account.id)) || (sess.user && sess.user.id) || "";
-    const name = email || accountId || "acct-" + Date.now();
-    upsertAccount(name, { st, email, accountId }); // 合并保留既有凭证(如先导入的 refresh_token)
-    setActive(name); // 捕获的就是当前登录态,直接对齐,避免面板显示陈旧的「当前」
-    toast("已保存/更新账号:" + name);
-    return name;
+    const p = parseSession(sess);
+    const key = p.email || p.accountId || p.userId || "acct-" + Date.now();
+    // accountId 存新工作区 UUID;planType/name 落库,列表显示套餐徽标
+    upsertAccount(key, {
+      st, email: p.email, name: p.name,
+      accountId: p.accountId || p.userId, planType: p.planType,
+    });
+    setActive(key); // 捕获的就是当前登录态,直接对齐,避免面板显示陈旧的「当前」
+    toast("已保存/更新账号:" + key);
+    return key;
   }
 
   function importAccountsJson(parsed) {
@@ -714,6 +761,11 @@
       badge.title = "仅有 API/OAuth 凭证,网页切换需要 ST;登录该账号后点「保存当前账号」自动补齐";
       row.appendChild(badge);
     }
+    if (acct && acct.planType && acct.planType !== "free") {
+      const plan = el("span", "cas-badge cas-badge-plan", acct.planType.toUpperCase());
+      plan.title = "账号套餐(来自 /api/auth/session account.planType)";
+      row.appendChild(plan);
+    }
 
     // 主操作按钮:有 ST → 切换;仅 API/OAuth 凭证 → 复制 Token(网页切换本就不可用)
     if (acct && acct.st) {
@@ -991,14 +1043,14 @@
   async function main() {
     injectStyle();
     const sess = await fetchSession();
-    const email = (sess && sess.user && sess.user.email) || "";
+    const p = parseSession(sess);
+    const email = p ? p.email : "";
     if (sess) {
       // 自愈:当前登录态能对上已存账号才标记 active;手动换到未保存的账号时清空跟踪
       const all = getAccounts();
-      const uid = (sess.user && sess.user.id) || "";
       let match = null;
       for (const n of Object.keys(all)) {
-        if (n === email || (uid && all[n].accountId === uid) || (email && all[n].email === email)) { match = n; break; }
+        if (n === p.email || sessionMatchesAcct(p, all[n])) { match = n; break; }
       }
       setActive(match);
       store.set("cas_invalid", false);
@@ -1045,6 +1097,7 @@
       refreshCurrentSt, readCurrentSt,
       generatePlusLink, buildBothCheckoutUrls, buildLongLinkUrls, inferMerchantPath,
       fragmentFromClientSecret, extractSessionIdFromAnyUrl, SUB_PRESETS,
+      parseSession, sessionMatchesAcct,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
   }
