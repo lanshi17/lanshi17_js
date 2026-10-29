@@ -41,14 +41,15 @@ test("S1 captureCurrent: session 有 user 无 account → null + toast,不写账
   assert.deepEqual(Object.keys(sb.cas.accounts()), []);
 });
 
-test("S2 captureCurrent: session 有 account 无 user → null + toast", async () => {
+test("S2 captureCurrent: session 缺 user 等同未登录 → null + toast,不写账号", async () => {
   const sb = createSandbox(SCRIPT, {
     cookies: ST_COOKIE,
     sessionHandler: () => ({ account: { id: "x" } }),
   });
   const r = await sb.cas.captureCurrent();
   assert.equal(r, null);
-  assert.ok(sb.toastTexts().some((t) => t.includes("会话字段缺失")));
+  await waitFor(() => sb.toastTexts().some((t) => t.includes("当前未登录")));
+  assert.deepEqual(Object.keys(sb.cas.accounts()), []);
 });
 // ---------- S3:正常捕获回归 ----------
 test("S3 captureCurrent: 完整新结构按 email/UUID/planType 落库", async () => {
@@ -62,12 +63,13 @@ test("S3 captureCurrent: 完整新结构按 email/UUID/planType 落库", async (
 });
 
 // ---------- S4:main 畸形 session 不崩溃 ----------
-test("S4 main: 加载时畸形 session 不抛异常,active=null", () => {
+test("S4 main: 加载时畸形 session 不抛异常,active 保持空", async () => {
   assert.doesNotThrow(() => createSandbox(SCRIPT, {
     sessionHandler: () => ({ user: { email: "a@b.com" } }),
   }));
   const sb = createSandbox(SCRIPT, { sessionHandler: () => ({ user: { email: "a@b.com" } }) });
-  assert.equal(sb.gmGetValue("cas_active"), null);
+  await waitFor(() => sb.gmGetValue("cas_invalid") === false); // main 终态分支落地标记
+  assert.ok(!sb.gmGetValue("cas_active")); // 不写入任何账号名
   assert.ok(sb.cas);
 });
 
@@ -149,6 +151,7 @@ test("S9 runSub: 冷却在 store 持久,重开面板仍被拦", async () => {
 // ---------- S10:stripeFetch URL 必须经 URL 解析 ----------
 test("S10 stripeFetch: 合法 init URL 放行,伪造 host/协议/路径穿越全部拒绝", async () => {
   const sb = createSandbox(SCRIPT);
+  sb.setXhrHandler(() => ({ status: 200, responseText: "{}" }));
   const good = "https://api.stripe.com/v1/payment_pages/cs_live_x/init";
   await sb.cas.stripeFetch(good, {}, "");
   assert.equal(sb.xhrCalls.length, 1);

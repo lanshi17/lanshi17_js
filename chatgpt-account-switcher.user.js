@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.6.0
+// @version      1.7.0
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -60,6 +60,13 @@
  * v1.6.1
  * - 导入容错:整体解析失败时截取 JSON 子串/逐行重试,粘贴内容前后混入杂字符不再误判
  * - toast 去重:相同消息连点不堆叠,只刷新计时
+ *
+ * v1.7.0(checkout 链路加固)
+ * - 修复畸形 session 崩溃:captureCurrent 在缺 account 时返回 null + toast,不再 TypeError;main 同步守卫
+ * - 请求指纹一致:Stripe init 删除伪造 User-Agent;browser_locale / elements locale 跟随 navigator.language;
+ *   checkout Accept-Language 跟随 navigator.languages(此前硬编码 zh-CN,与 IP/UA 矛盾是风控特征)
+ * - checkout 30s 超时(可注入),挂起不再永久 busy;订阅 15s 冷却落 store,关面板重开仍生效
+ * - stripeFetch 白名单改用 URL 解析:校验 https + 精确 host + 规范化 pathname,拦路径穿越
  */
 (function () {
   "use strict";
@@ -396,6 +403,7 @@
     if (!st) { toast("未找到会话 cookie(ST)"); return null; }
 
     const p = parseSession(sess);
+    if (!p) { toast("会话字段缺失:响应缺 account 或 user,无法保存"); return null; }
     const key = p.email;
     // accountId 存新工作区 UUID;planType/name 落库,列表显示套餐徽标
     upsertAccount(key, {
@@ -629,13 +637,15 @@
       ? crypto.randomUUID()
       : (Date.now().toString(16) + Math.random().toString(16).slice(2));
     const p = new URLSearchParams();
-    p.set("browser_locale", "en-US");
+    const fullLocale = navigator.language || "en-US";
+    const langCode = fullLocale.split("-")[0]; // elements 只要 2 位语言码:zh-CN → zh
+    p.set("browser_locale", fullLocale);
     p.set("elements_session_client[client_betas][0]", "custom_checkout_server_updates_1");
     p.set("elements_session_client[client_betas][1]", "custom_checkout_manual_approval_1");
     p.set("elements_session_client[elements_init_source]", "custom_checkout");
     p.set("elements_session_client[referrer_host]", "chatgpt.com");
     p.set("elements_session_client[stripe_js_id]", jsId);
-    p.set("elements_session_client[locale]", "en");
+    p.set("elements_session_client[locale]", langCode);
     p.set("elements_session_client[is_aggregation_expected]", "false");
     p.set("elements_options_client[saved_payment_method][enable_save]", "auto");
     p.set("elements_options_client[saved_payment_method][enable_redisplay]", "auto");
@@ -647,12 +657,22 @@
   // 跨域打 Stripe:优先 GM_xmlhttpRequest(无视同源,需头部 @connect api.stripe.com);
   // 无 GM 时降级 fetch(大概率 CORS 失败 → 调用方回退 checkout 直链,不致命)。
   // URL 白名单:仅允许 payment_pages init,防页面 XSS 借通道打任意域。
+  // 用 URL 解析而非字符串前缀:校验 https + 精确主机名 + 规范化后的精确 pathname。
+  // new URL 会折叠 ../,路径穿越后 pathname 变形,正则不匹配即拒。
+  function assertStripeInitUrl(url) {
+    let u;
+    try { u = new URL(url); } catch (e) { throw new Error("拒绝:非法 Stripe init URL"); }
+    if (u.protocol !== "https:" || u.hostname !== "api.stripe.com" || u.search || u.hash) {
+      throw new Error("拒绝:非法 Stripe init URL");
+    }
+    if (!/^\/v1\/payment_pages\/(cs_(?:live|test)_[A-Za-z0-9]+)\/init$/.test(u.pathname)) {
+      throw new Error("拒绝:非法 Stripe init URL");
+    }
+  }
   function stripeFetch(url, headers, body) {
     return new Promise((resolve, reject) => {
-      if (typeof url !== "string" || url.indexOf(STRIPE_INIT_BASE) !== 0 || !/\/init$/.test(url)) {
-        reject(new Error("拒绝:非法 Stripe init URL"));
-        return;
-      }
+      try { assertStripeInitUrl(url); }
+      catch (e) { reject(e); return; }
       if (typeof GM_xmlhttpRequest === "function") {
         GM_xmlhttpRequest({
           method: "POST", url: url, headers: headers, data: body, timeout: 15000,
@@ -673,7 +693,6 @@
     const headers = {
       "Authorization": "Bearer " + pk,
       "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     };
     const res = await stripeFetch(url, headers, buildStripeInitBody(pk));
     let data = {};
@@ -704,20 +723,37 @@
     }
   }
 
-  async function postCheckout(body, accessToken) {
-    const r = await fetch(CHECKOUT_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": "Bearer " + accessToken,
-        "Content-Type": "application/json",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-      },
-      body: JSON.stringify(body),
-    });
-    const text = await r.text();
+  function buildAcceptLanguage() {
+    const ls = (navigator.languages && navigator.languages.length)
+      ? navigator.languages : [navigator.language || "en-US"];
+    return ls.map((l, i) => (i === 0 ? l : l + ";q=" + (1 - i * 0.1).toFixed(1))).join(",");
+  }
+  async function postCheckout(body, accessToken, timeoutMs) {
+    timeoutMs = timeoutMs || 30000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let text = "";
+    try {
+      const r = await fetch(CHECKOUT_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + accessToken,
+          "Content-Type": "application/json",
+          "Accept-Language": buildAcceptLanguage(),
+        },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      text = await r.text();
+      if (!r.ok) throw new Error("checkout 失败 HTTP " + r.status + ":" + text.slice(0, 300));
+    } catch (e) {
+      if (ctrl.signal.aborted) throw new Error("checkout 请求超时(" + timeoutMs + "ms)");
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     let data = {};
-    try { data = JSON.parse(text); } catch (e) { /* 非 JSON 则走失败分支 */ }
-    if (!r.ok) throw new Error("checkout 失败 HTTP " + r.status + ":" + text.slice(0, 300));
+    try { data = JSON.parse(text); } catch (e) { /* 非 JSON 则返回空对象 */ }
     return data;
   }
 
@@ -955,7 +991,6 @@
     };
     // OpenAI 对 checkout 生成有风控:连点/短时多次生成、出口 IP 与 billing 国家对不上都可能 400 unusual activity。
     // 这里做两件事:15s 防连点冷却 + 把风控 400 翻译成可操作的中文建议,不直接甩原始英文。
-    let lastSubAt = 0;
     const SUB_COOLDOWN_MS = 15000;
     function subErrMsg(e) {
       const raw = ((e && e.message) || String(e));
@@ -974,12 +1009,12 @@
          subStatus.textContent = "国家填 2 位字母(如 PH),币种填 3 位字母(如 PHP)";
          return;
        }
-      const waitMs = SUB_COOLDOWN_MS - (Date.now() - lastSubAt);
+      const waitMs = SUB_COOLDOWN_MS - (Date.now() - store.get("cas_sub_last_at", 0));
       if (waitMs > 0) {
         subStatus.textContent = "点太快了,等 " + Math.ceil(waitMs / 1000) + " 秒再试(防 OpenAI 风控计数)";
         return;
       }
-      lastSubAt = Date.now();
+      store.set("cas_sub_last_at", Date.now());
        setBusy(true);
        subResult.classList.remove("is-open");
        subStatus.textContent = "生成中:" + country + "/" + currency + " → checkout → Stripe init 长链…";
@@ -1059,7 +1094,7 @@
     const sess = await fetchSession();
     const p = parseSession(sess);
     const email = p ? p.email : "";
-    if (sess) {
+    if (p) {
       // 自愈:当前登录态能对上已存账号才标记 active;手动换到未保存的账号时清空跟踪
       const all = getAccounts();
       let match = null;

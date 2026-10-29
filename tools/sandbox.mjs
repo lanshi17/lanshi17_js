@@ -71,8 +71,7 @@ function makeElement(tag) {
     get: () => _innerHTML,
     set: (markup) => {
       _innerHTML = markup;
-      node.children = parseHtml(markup);
-      for (const c of node.children) node.appendChild(c);
+      node.children = parseHtml(markup); // parseHtml 返回的元素即为子节点,不再 append(自遍历自 push 会无限增长)
     },
   });
   return node;
@@ -185,11 +184,11 @@ export function createSandbox(scriptPath, opts = {}) {
     fetch: fetchShim,
     crypto: webcrypto,
     AbortController,
+    URL: nodeUrl.URL,
     URLSearchParams: nodeUrl.URLSearchParams,
     setTimeout, clearTimeout,
     console,
     prompt: (...args) => { promptCalls.push(args); return null; },
-
     GM_getValue: (k) => gmStore.has(k) ? gmStore.get(k) : undefined,
     GM_setValue: (k, v) => { gmStore.set(k, v); },
     GM_cookie: {

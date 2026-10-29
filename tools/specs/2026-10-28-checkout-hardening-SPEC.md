@@ -37,10 +37,12 @@ Feature: checkout 链路加固
     And   toast 出现,文案包含 "会话字段缺失"
     And   cas_active 不变,不产生新账号记录
 
-  Scenario: S2 捕获时 session 缺 user 字段同样不崩溃
+  Scenario: S2 捕获时 session 缺 user 字段不崩溃(等同未登录)
     Given session 返回 {"account":{"id":"x"}}
     When  captureCurrent()
-    Then  返回 null,toast 含 "会话字段缺失",不写入账号
+    Then  返回 null
+    And   toast 含 "当前未登录"(fetchSession 以 user 存在为登录判据,缺 user 即判未登录,不进入字段缺失分支)
+    And   不写入账号
 
   Scenario: S3 正常捕获仍按新结构落库(回归)
     Given session 返回完整新结构(email=u@x.com, account.id=UUID74ac, planType=plus)
@@ -50,7 +52,7 @@ Feature: checkout 链路加固
   Scenario: S4 main 自愈在畸形 session 下不崩溃
     Given session 有 user 无 account
     When  main() 执行
-    Then  不抛异常,active 被置为 null
+    Then  不抛异常,active 保持空(终态分支不调用 setActive,不写入账号名)
 
   Scenario: S5 Stripe init 不再伪造 User-Agent
     Given 已通过 checkout 拿到 cs_id + pk
@@ -121,4 +123,6 @@ Feature: checkout 链路加固
 
 ## Revisions
 
-- (none yet)
+- 2026-10-29 R1:S2 预期从「会话字段缺失」改为「当前未登录」——实现阶段确认 fetchSession 以 j.user 存在为登录判据,缺 user 直接返回 null,会话字段缺失分支只覆盖「有 user 无 account」(S1)。
+- 2026-10-29 R2:S4 断言本身不变(active=null),测试增加等待 main 异步完成后再读存储;非行为变更。
+- 2026-10-29 R3:S4 实际行为确认:main 在 parseSession 失败的终态分支不调用 setActive,active 保持原状(全新环境为未设置),断言从 ===null 改为 falsy;取代 R2 中 active=null 的描述。
