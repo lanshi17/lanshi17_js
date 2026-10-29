@@ -284,6 +284,8 @@
     for (const old of host.children) {
       if (old.textContent === msg) { clearTimeout(old._casTimer); old._casTimer = setTimeout(() => old.remove(), ms || 3000); return; }
     }
+    const t = el("div", "cas-toast", msg);
+    host.appendChild(t);
     t._casTimer = setTimeout(() => t.remove(), ms || 3000);
   }
 
@@ -1109,6 +1111,7 @@
       refreshCurrentSt, readCurrentSt,
       generatePlusLink, buildBothCheckoutUrls, buildLongLinkUrls, inferMerchantPath,
       fragmentFromClientSecret, extractSessionIdFromAnyUrl, SUB_PRESETS,
+      postCheckout, stripeFetch, buildStripeInitBody,
       parseSession, sessionMatchesAcct,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
