@@ -30,15 +30,20 @@
 | V1 删旧 cookie 失败 → 中止不写新 ST | tools/run-tests.mjs::"V1 …" | pass |
 | V2 服务端拒绝会话 → 不 reload 并说明 | tools/run-tests.mjs::"V2 …" | pass |
 | V3 服务端认了 → 置 active 并 reload（回归护甲） | tools/run-tests.mjs::"V3 …" | pass |
+| W1 捕获记录真实 cookie 名（不假设 next-auth） | tools/run-tests.mjs::"W1 …" | pass |
+| W2 切换按记录的名字写回，不改名 | tools/run-tests.mjs::"W2 …" | pass |
+| W3 任意前缀旧分块都被清掉 | tools/run-tests.mjs::"W3 …" | pass |
+| X1 事后吊销 → 明确报因（只报一次） | tools/run-tests.mjs::"X1 …" | pass |
+| X2 写入即被拒 → 报拒绝 | tools/run-tests.mjs::"X2 …" | pass |
 
 ## Gauntlet (final fresh run, `tools/gauntlet.sh 412d59e`)
 
 | Layer | Command | Result |
 |---|---|---|
 | L1 Syntax | `node --check chatgpt-account-switcher.user.js` | OK |
-| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **17 passed, 0 failed**, duration 3271.6ms |
-| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 102, executable **102**, non-code 0 → **102/102 covered** |
-| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**9/9 killed** |
+| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **22 passed, 0 failed**, duration 3307.3ms |
+| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 154, executable **154**, non-code 0 → **154/154 covered** |
+| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**12/12 killed** |
 | L5 Determinism | 第二次完整跑 L2 | OK（SUBSTITUTED,见下） |
 | Real execution | vm 沙箱加载真实 userscript,panel/capture/checkout→stripe 全链 mock 跑通 | L2 全部测试即此证据;真实网络未打（无登录态） |
 | Supply chain | 依赖集未变 | 0 new deps;无 npm audit 对象 |
@@ -53,6 +58,9 @@
 - M7 删除失败中止判定反转 → killed（V1）
 - M8 服务端拒绝时不阻断刷新 → killed（V2）
 - M9 切换成功后不 reload → killed（V3）
+- M10 会话 cookie 名退回硬编码 → killed（W1/W3）
+- M11 忽略记录的 cookie 名 → killed（W2）
+- M12 切换结果回读判定反转 → killed（X1/X2）
 
 Checker 负向对照:
 - `mutate.mjs`: 缺失定位串 → 替换计数必须为 0 的守卫路径实际执行（输出 "negative control: absent-marker → 0 replacements"）;定位串出现次数 ≠1 时 exit 1。

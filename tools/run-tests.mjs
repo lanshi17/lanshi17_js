@@ -260,3 +260,65 @@ test("V3 switchTo: 服务端认了 → 标记 active 并 reload", async () => {
   assert.equal(sb.reloadCount(), 1);
   assert.equal(sb.gmGetValue("cas_active"), "a@b.com");
 });
+
+// ---------- W1-W3:会话 cookie 名不写死(服务端改名 next-auth → authjs 时仍可用) ----------
+test("W1 captureCurrent: 记录真实 cookie 名,不假设 next-auth", async () => {
+  const sb = createSandbox(SCRIPT, {
+    cookies: [{ name: "__Secure-authjs.session-token", value: "AUTHJS-ST", domain: "chatgpt.com" }],
+    sessionHandler: () => validSession,
+  });
+  const key = await sb.cas.captureCurrent();
+  assert.equal(key, "u@x.com");
+  const rec = sb.cas.accounts()[key];
+  assert.equal(rec.cookieSet.length, 1);
+  assert.equal(rec.cookieSet[0].name, "__Secure-authjs.session-token");
+  assert.equal(rec.st, "AUTHJS-ST");
+});
+
+test("W2 switchTo: 按捕获时的 cookie 名写回,不改名", async () => {
+  let sess = null;
+  const sb = createSandbox(SCRIPT, {
+    cookies: [{ name: "__Secure-next-auth.session-token", value: "OLD", domain: "chatgpt.com" }],
+    gmValues: { cas_accounts: { "a@b.com": {
+      st: "AUTHJS-ST", email: "a@b.com", accountId: "WANT",
+      cookieSet: [{ name: "__Secure-authjs.session-token", value: "AUTHJS-ST", domain: "chatgpt.com" }],
+    } } },
+    sessionHandler: () => sess,
+  });
+  await waitFor(() => sb.gmGetValue("cas_invalid") === false);
+  sess = { account: { id: "WANT" }, user: { id: "u", email: "a@b.com" } };
+  const ok = await sb.cas.switchTo("a@b.com");
+  assert.equal(ok, true);
+  assert.deepEqual(sb.cookieNames(), ["__Secure-authjs.session-token"]);
+});
+
+test("W3 applySwitch: 任意前缀的旧分块 cookie 都会被清掉", async () => {
+  const sb = createSandbox(SCRIPT, {
+    cookies: [
+      { name: "__Secure-authjs.session-token.0", value: "X", domain: "chatgpt.com" },
+      { name: "__Secure-authjs.session-token.1", value: "Y", domain: "chatgpt.com" },
+    ],
+    gmValues: { cas_accounts: { "a@b.com": targetAcct } },
+  });
+  const ok = await sb.cas.applySwitch("a@b.com");
+  assert.equal(ok, true);
+  assert.deepEqual(sb.cookieNames(), ["__Secure-next-auth.session-token"]);
+});
+
+// ---------- X1-X2:刷新后回读切换结果(区分「写入即拒」与「事后吊销」) ----------
+test("X1 main: 上次切换被事后吊销 → 明确报因,且只报一次", async () => {
+  const sb = createSandbox(SCRIPT, {
+    gmValues: { cas_last_switch: { name: "a@b.com", verdict: "accepted", at: Date.now() } },
+    sessionHandler: () => null,
+  });
+  await waitFor(() => sb.toastTexts().some((t) => t.includes("事后吊销")));
+  assert.equal(sb.gmGetValue("cas_last_switch"), null);
+});
+
+test("X2 main: 上次切换写入即被拒 → 报拒绝", async () => {
+  const sb = createSandbox(SCRIPT, {
+    gmValues: { cas_last_switch: { name: "a@b.com", verdict: "rejected", at: Date.now() } },
+    sessionHandler: () => null,
+  });
+  await waitFor(() => sb.toastTexts().some((t) => t.includes("写入即被服务端拒绝")));
+});

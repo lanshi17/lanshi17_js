@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.7.1
+// @version      1.7.2
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -75,6 +75,12 @@
  * - 切换后先向 /api/auth/session 校验服务端是否真的认这个会话;明确被拒则不刷新页面并说明原因
  *   (刷新只会把人弹到登录页、把原因冲掉);校验本身异常时不拦,照常刷新
  * - 修正 ST 有效期说明:access_token 的 exp-iat 实测固定 10 天,不是 30 天
+ *
+ * v1.7.2(会话 cookie 名去硬编码 + 失败可归因)
+ * - 不再假设 cookie 叫 __Secure-next-auth.session-token:捕获时记录真实 cookie 名/域名,
+ *   切换时原样写回,任何前缀(next-auth / authjs)都可用;删除也按后缀匹配,清得干净
+ * - 刷新后回读上次切换结果:区分「写入即被服务端拒绝」与「服务端接受后又被吊销」,
+ *   两种失败原本都只表现为秒退,现在会直接说明是哪一种
  */
 (function () {
   "use strict";
@@ -111,6 +117,7 @@
       name: patch.name || prev.name || "",
       accountId: patch.accountId || prev.accountId || "",
       planType: patch.planType || prev.planType || "",
+      cookieSet: (patch.cookieSet && patch.cookieSet.length) ? patch.cookieSet : (prev.cookieSet || []),
       addedAt: prev.addedAt || patch.addedAt || new Date().toISOString(),
     };
     putAccounts(all);
@@ -352,7 +359,10 @@
     new Promise((res, rej) =>
       GM_cookie.delete(details, (err) => (err ? rej(err) : res())));
 
-  const isSessionCookie = (c) => c.name === COOKIE_BASE || c.name.startsWith(COOKIE_BASE + ".");
+  // 会话 cookie 的实际名字不再写死:next-auth / authjs 等前缀都可能出现,只匹配后缀
+  const SESSION_COOKIE_RE = /(?:^|\.)session-token(?:\.\d+)?$/;
+  const isSessionCookie = (c) => SESSION_COOKIE_RE.test(c.name);
+  const isChunkName = (name) => /\.\d+$/.test(name);
 
   function numSuffix(name) {
     const m = name.lastIndexOf(".");
@@ -368,12 +378,17 @@
 
   // 读取当前浏览器里的实际 ST(分块按序重组);读不到返回 ""
   async function readCurrentSt() {
-    const cookies = (await gmList().catch(() => [])).filter(isSessionCookie);
+    return (await readCurrentCookieSet()).map((c) => c.value).join("");
+  }
+  // 记录当前会话 cookie 的完整集合(名字/值/domain),切换时原样写回。
+  // 这样即使服务端给 cookie 改了名(next-auth → authjs),脚本也不必跟着改。
+  async function readCurrentCookieSet() {
+    const cs = (await gmList().catch(() => [])).filter(isSessionCookie);
     // 分块(.0/.1/…)按序重组;整 cookie 与分块并存属异常残留,以分块为准
-    const chunks = cookies
-      .filter((c) => c.name !== COOKIE_BASE)
+    const numbered = cs.filter((c) => isChunkName(c.name))
       .sort((a, b) => numSuffix(a.name) - numSuffix(b.name));
-    return (chunks.length ? chunks : cookies).map((c) => c.value).join("");
+    const list = numbered.length ? numbered : cs;
+    return list.map((c) => ({ name: c.name, value: c.value, domain: c.domain || location.hostname }));
   }
   // 登录态对上已存账号且浏览器 ST 与存量不一致时静默覆盖(导入旧快照 / ST 滚动续期自愈)
   // 返回更新的账号名;未登录/对不上/一致返回 null,不打扰用户
@@ -407,7 +422,8 @@
   async function captureCurrent() {
     const sess = await fetchSession();
     if (!sess) { toast("当前未登录,无法捕获账号"); return null; }
-    const st = await readCurrentSt();
+    const cookieSet = await readCurrentCookieSet();
+    const st = cookieSet.map((c) => c.value).join("");
     if (!st) { toast("未找到会话 cookie(ST)"); return null; }
 
     const p = parseSession(sess);
@@ -416,7 +432,7 @@
     // accountId 存新工作区 UUID;planType/name 落库,列表显示套餐徽标
     upsertAccount(key, {
       st, email: p.email, name: p.name,
-      accountId: p.accountId, planType: p.planType,
+      accountId: p.accountId, planType: p.planType, cookieSet,
     });
     setActive(key); // 捕获的就是当前登录态,直接对齐,避免面板显示陈旧的「当前」
     toast("已保存/更新账号:" + key);
@@ -507,16 +523,23 @@
         toast("切换中止:旧会话 cookie 删除失败(" + failed.join(",") + "),未写入新 ST。请手动清除该站 cookie 后重试");
         return false;
       }
-      // 2) 写入新 ST(超长分块);写入失败必须可见,不能默默烂在半路
-      const parts = chunkSt(acct.st);
-      for (let i = 0; i < parts.length; i++) {
+      // 2) 写入 ST。优先按捕获时记录的 cookie 名/域名原样写回(服务端可能已改名);
+      //    老记录只有拼接后的 st 时,按默认名分块写。写入失败必须可见,不能默默烂在半路
+      const set = (acct.cookieSet && acct.cookieSet.length) ? acct.cookieSet : null;
+      const targets = set || chunkSt(acct.st).map((v, i, arr) => ({
+        name: arr.length === 1 ? COOKIE_BASE : COOKIE_BASE + "." + i,
+        value: v,
+        domain: location.hostname,
+      }));
+      for (const c of targets) {
         await gmSet({
-          name: parts.length === 1 ? COOKIE_BASE : COOKIE_BASE + "." + i,
-          value: parts[i],
-          domain: location.hostname,
+          name: c.name,
+          value: c.value,
+          domain: c.domain || location.hostname,
           path: "/",
           secure: SECURE,
           httpOnly: true,
+          sameSite: "lax",
         });
       }
     } catch (e) {
@@ -540,15 +563,30 @@
     }
   }
 
+  // 刷新后回读上次切换结果:把「写入即被拒」与「接受了但随即被吊销」分开,
+// 否则两种失败在用户眼里都只是「秒退」,无法定位。
+  function reportLastSwitch(p) {
+    const last = store.get("cas_last_switch", null);
+    if (!last || !last.at || Date.now() - last.at > 180000) return;
+    store.set("cas_last_switch", null); // 只报一次
+    if (last.verdict === "rejected") {
+      toast("上次切到 " + last.name + ":写入即被服务端拒绝 —— ST 已失效或该 cookie 不被识别");
+    } else if (!p) {
+      toast("上次切到 " + last.name + ":服务端当时接受了,刷新后会话已失效 —— 属于事后吊销(常见于 ST 在别的设备/IP 签发)");
+    }
+  }
+
   async function switchTo(name) {
     const ok = await applySwitch(name);
     if (!ok) return false;
     const verdict = await verifySession(getAccounts()[name] || {});
     if (verdict === false) {
+      store.set("cas_last_switch", { name: name, verdict: "rejected", at: Date.now() });
       // 不 reload:刷新只会把用户弹到登录页并把原因冲掉
       toast("已写入 ST,但服务端拒绝了这个会话(ST 过期/被吊销/cookie 已不再使用);未刷新页面,请重新捕获后再试");
       return false;
     }
+    store.set("cas_last_switch", { name: name, verdict: "accepted", at: Date.now() });
     setActive(name);
     location.reload(); // 换 cookie 后必须刷新,页面才会以新身份重建
     return true;
@@ -1130,6 +1168,7 @@
     const sess = await fetchSession();
     const p = parseSession(sess);
     const email = p ? p.email : "";
+    reportLastSwitch(p);
     if (p) {
       // 自愈:当前登录态能对上已存账号才标记 active;手动换到未保存的账号时清空跟踪
       const all = getAccounts();

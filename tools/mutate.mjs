@@ -41,6 +41,15 @@ const MUTANTS = [
   { id: "M9", desc: "切换成功后不 reload(V3 回归护甲)",
     old: 'location.reload(); // 换 cookie 后必须刷新,页面才会以新身份重建',
     now: '; // 换 cookie 后必须刷新,页面才会以新身份重建' },
+  { id: "M10", desc: "会话 cookie 名退回硬编码 next-auth",
+    old: 'const isSessionCookie = (c) => SESSION_COOKIE_RE.test(c.name);',
+    now: 'const isSessionCookie = (c) => c.name === COOKIE_BASE || c.name.startsWith(COOKIE_BASE + ".");' },
+  { id: "M11", desc: "忽略捕获时记录的 cookie 名,一律用默认名写回",
+    old: 'const set = (acct.cookieSet && acct.cookieSet.length) ? acct.cookieSet : null;',
+    now: 'const set = null;' },
+  { id: "M12", desc: "切换结果回读判定反转(拒/吊销混为一谈)",
+    old: 'if (last.verdict === "rejected") {',
+    now: 'if (last.verdict !== "rejected") {' },
 ];
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
