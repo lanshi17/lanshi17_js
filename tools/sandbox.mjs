@@ -44,6 +44,7 @@ function makeElement(tag) {
     contains: (c) => node.className.split(/\s+/).includes(c),
   };
   node.appendChild = (child) => { node.children.push(child); child.isConnected = true; return child; };
+  node.click = () => { node.clicked = (node.clicked || 0) + 1; if (typeof node.onclick === "function") node.onclick(); };
   node.append = (...cs) => cs.forEach((c) => node.appendChild(c));
   node.remove = () => { node.isConnected = false; };
   function walk(fn) {
@@ -121,6 +122,8 @@ export function createSandbox(scriptPath, opts = {}) {
   let cookies = opts.cookies ? opts.cookies.map((c) => ({ ...c })) : [];
   let deleteFail = () => false;
 
+  const anchors = [];
+  const blobs = [];
   const htmlRoot = makeElement("html");
   const head = makeElement("head");
   htmlRoot.appendChild(head);
@@ -128,7 +131,7 @@ export function createSandbox(scriptPath, opts = {}) {
   const doc = {
     head,
     documentElement: htmlRoot,
-    createElement: (t) => makeElement(t),
+    createElement: (t) => { const e = makeElement(t); if (String(t).toLowerCase() === "a") anchors.push(e); return e; },
     getElementById: (id) => htmlRoot.getElementById(id),
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -178,15 +181,25 @@ export function createSandbox(scriptPath, opts = {}) {
     }
   }
 
+  class BlobShim {
+    constructor(parts, opts) { this.parts = parts || []; this.type = (opts && opts.type) || ""; }
+    text() { return Promise.resolve(this.parts.join("")); }
+    get size() { return this.parts.join("").length; }
+  }
+  class URLShim extends nodeUrl.URL {}
+  URLShim.createObjectURL = (blob) => { const u = "blob:mock/" + blobs.length; blobs.push({ url: u, blob }); return u; };
+  URLShim.revokeObjectURL = () => {};
+
   const ctx = {
     window: undefined,
+    Blob: BlobShim,
     document: doc,
     navigator: navigatorShim,
     location: locationShim,
     fetch: fetchShim,
     crypto: webcrypto,
     AbortController,
-    URL: nodeUrl.URL,
+    URL: URLShim,
     URLSearchParams: nodeUrl.URLSearchParams,
     setTimeout, clearTimeout,
     console,
@@ -228,6 +241,8 @@ export function createSandbox(scriptPath, opts = {}) {
     setDeleteFail: (fn) => { deleteFail = fn; },
     cookieNames: () => cookies.map((c) => c.name),
     cookies: () => cookies.map((c) => ({ ...c })),
+    anchors: () => anchors.map((a) => ({ href: a.href, download: a.download, clicked: a.clicked || 0 })),
+    blobTexts: () => blobs.map((b) => b.blob.parts.join("")),
     reloadCount: () => reloadCount,
     setNavigator: (language, languages) => {
       navigatorShim.language = language;
@@ -243,6 +258,7 @@ export function createSandbox(scriptPath, opts = {}) {
       const host = doc.getElementById("cas-toasts");
       return host ? host.children.map((c) => c.textContent) : [];
     },
+    getElement: (id) => doc.getElementById(id),
     getElementText: (id) => {
       const el = doc.getElementById(id);
       return el ? el.textContent : null;

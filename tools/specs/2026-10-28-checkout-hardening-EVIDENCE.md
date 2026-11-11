@@ -35,15 +35,22 @@
 | W3 任意前缀旧分块都被清掉 | tools/run-tests.mjs::"W3 …" | pass |
 | X1 事后吊销 → 明确报因（只报一次） | tools/run-tests.mjs::"X1 …" | pass |
 | X2 写入即被拒 → 报拒绝 | tools/run-tests.mjs::"X2 …" | pass |
+| E1 备份 payload version 2 + count | tools/run-tests.mjs::"E1 …" | pass |
+| E2 备份文件名带本地时间 | tools/run-tests.mjs::"E2 …" | pass |
+| E3 导入区分新增/更新 | tools/run-tests.mjs::"E3 …" | pass |
+| E4 搜索子串过滤（大小写不敏感） | tools/run-tests.mjs::"E4 …" | pass |
+| E5 多账号显示搜索框并即时过滤 | tools/run-tests.mjs::"E5 …" | pass |
+| E6 导出触发 .json 下载且内容正确 | tools/run-tests.mjs::"E6 …" | pass |
+| E7 拖放文件即导入 | tools/run-tests.mjs::"E7 …" | pass |
 
 ## Gauntlet (final fresh run, `tools/gauntlet.sh 412d59e`)
 
 | Layer | Command | Result |
 |---|---|---|
 | L1 Syntax | `node --check chatgpt-account-switcher.user.js` | OK |
-| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **22 passed, 0 failed**, duration 3307.3ms |
-| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 154, executable **154**, non-code 0 → **154/154 covered** |
-| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**12/12 killed** |
+| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **29 passed, 0 failed**, duration 3305.0ms |
+| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 292, executable **292**, non-code 0 → **292/292 covered** |
+| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**16/16 killed** |
 | L5 Determinism | 第二次完整跑 L2 | OK（SUBSTITUTED,见下） |
 | Real execution | vm 沙箱加载真实 userscript,panel/capture/checkout→stripe 全链 mock 跑通 | L2 全部测试即此证据;真实网络未打（无登录态） |
 | Supply chain | 依赖集未变 | 0 new deps;无 npm audit 对象 |
@@ -61,6 +68,10 @@
 - M10 会话 cookie 名退回硬编码 → killed（W1/W3）
 - M11 忽略记录的 cookie 名 → killed（W2）
 - M12 切换结果回读判定反转 → killed（X1/X2）
+- M13 备份版本号退回 1 → killed（E1）
+- M14 搜索变大小写敏感 → killed（E4）
+- M15 新增/更新计数互换 → killed（E3）
+- M16 列表渲染忽略搜索词 → killed（E5）
 
 Checker 负向对照:
 - `mutate.mjs`: 缺失定位串 → 替换计数必须为 0 的守卫路径实际执行（输出 "negative control: absent-marker → 0 replacements"）;定位串出现次数 ≠1 时 exit 1。

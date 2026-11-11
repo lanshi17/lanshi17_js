@@ -322,3 +322,71 @@ test("X2 main: 上次切换写入即被拒 → 报拒绝", async () => {
   });
   await waitFor(() => sb.toastTexts().some((t) => t.includes("写入即被服务端拒绝")));
 });
+
+// ---------- E1-E7:备份 / 导入 / 导出 / 搜索 ----------
+test("E1 buildBackupPayload: version 2 + count + accounts 原样", () => {
+  const sb = createSandbox(SCRIPT);
+  const p = JSON.parse(sb.cas.buildBackupPayload({ "a@b.com": { st: "X", email: "a@b.com" } }));
+  assert.equal(p.app, "chatgpt-account-switcher");
+  assert.equal(p.version, 2);
+  assert.equal(p.count, 1);
+  assert.equal(p.accounts["a@b.com"].st, "X");
+});
+
+test("E2 backupFileName: 本地时间命名,多次导出不覆盖", () => {
+  const sb = createSandbox(SCRIPT);
+  assert.equal(sb.cas.backupFileName(new Date(2026, 0, 5, 9, 7)), "chatgpt-accounts-20260105-0907.json");
+});
+
+test("E3 importAccountsJson: 区分新增与更新", () => {
+  const sb = createSandbox(SCRIPT);
+  const first = sb.cas.importAccountsJson({ accounts: [{ sessionToken: "S1", email: "a@b.com" }] });
+  assert.deepEqual([first.added, first.updated], [1, 0]);
+  const second = sb.cas.importAccountsJson({ accounts: [{ sessionToken: "S2", email: "a@b.com" }] });
+  assert.deepEqual([second.added, second.updated], [0, 1]);
+  assert.equal(sb.cas.accounts()["a@b.com"].st, "S2");
+});
+
+test("E4 filterNames: 大小写不敏感子串匹配,空白返回全部", () => {
+  const sb = createSandbox(SCRIPT);
+  const names = ["Alice@x.com", "bob@y.com", "carol"];
+  assert.deepEqual(sb.cas.filterNames(names, "BOB"), ["bob@y.com"]);
+  assert.deepEqual(sb.cas.filterNames(names, "  "), names);
+  assert.deepEqual(sb.cas.filterNames(names, "zzz"), []);
+});
+
+test("E5 panel: 多账号显示搜索框,输入后只剩匹配行", () => {
+  const sb = createSandbox(SCRIPT, {
+    gmValues: { cas_accounts: { "a@x.com": { st: "A" }, "b@y.com": { st: "B" } } },
+  });
+  sb.cas.panel();
+  const search = sb.getElement("cas-search");
+  assert.equal(search.style.display, "");
+  search.value = "a@";
+  search.oninput();
+  const rows = sb.getElement("cas-list").children.filter((c) => String(c.className).includes("cas-row"));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].children[1].textContent, "a@x.com");
+});
+
+test("E6 exportBackupToFile: 生成 .json 下载,内容含账号", () => {
+  const sb = createSandbox(SCRIPT, { gmValues: { cas_accounts: { "a@x.com": { st: "A" } } } });
+  const r = sb.cas.exportBackupToFile();
+  assert.ok(r.name.endsWith(".json"));
+  const a = sb.anchors()[0];
+  assert.equal(a.download, r.name);
+  assert.equal(a.clicked, 1);
+  assert.equal(JSON.parse(sb.blobTexts()[0]).count, 1);
+});
+
+test("E7 panel: 拖放文件即导入", async () => {
+  const sb = createSandbox(SCRIPT);
+  sb.cas.panel();
+  const card = sb.getElement("cas-card");
+  await card.ondrop({
+    preventDefault() {},
+    dataTransfer: { files: [{ name: "x.json", text: () => Promise.resolve(JSON.stringify({ sessionToken: "S", email: "d@e.com" })) }] },
+  });
+  await waitFor(() => !!sb.cas.accounts()["d@e.com"]);
+  assert.equal(sb.cas.accounts()["d@e.com"].st, "S");
+});

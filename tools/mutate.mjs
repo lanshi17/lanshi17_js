@@ -50,6 +50,18 @@ const MUTANTS = [
   { id: "M12", desc: "切换结果回读判定反转(拒/吊销混为一谈)",
     old: 'if (last.verdict === "rejected") {',
     now: 'if (last.verdict !== "rejected") {' },
+  { id: "M13", desc: "备份版本号退回 1",
+    old: "version: BACKUP_VERSION,",
+    now: "version: 1," },
+  { id: "M14", desc: "搜索变成大小写敏感",
+    old: 'const t = String(q || "").trim().toLowerCase();',
+    now: 'const t = String(q || "").trim();' },
+  { id: "M15", desc: "导入新增/更新计数互换",
+    old: 'if (before[key]) updated++; else added++;',
+    now: 'if (before[key]) added++; else updated++;' },
+  { id: "M16", desc: "列表渲染忽略搜索词",
+    old: 'const shown = filterNames(names, q);',
+    now: 'const shown = names;' },
 ];
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");

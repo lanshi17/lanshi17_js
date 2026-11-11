@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.7.2
+// @version      1.8.0
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -81,6 +81,12 @@
  *   切换时原样写回,任何前缀(next-auth / authjs)都可用;删除也按后缀匹配,清得干净
  * - 刷新后回读上次切换结果:区分「写入即被服务端拒绝」与「服务端接受后又被吊销」,
  *   两种失败原本都只表现为秒退,现在会直接说明是哪一种
+ *
+ * v1.8.0(备份/导入/导出优化 + 界面打磨)
+ * - 备份可导出为 .json 文件(文件名带本地时间,多次导出不覆盖),剪贴板导出保留;payload 升到 version 2 并带 count
+ * - 导入回报「新增 X 个,更新 Y 个」,不再只报总数;支持把文件直接拖到面板上导入;Ctrl/Cmd+Enter 提交
+ * - 账号多于一屏时出现搜索框,按子串即时过滤
+ * - 面板加宽到 380px、列表高度自适应(52vh 上限),空状态与导入区文案重写;复制 Token 成功给按钮文字反馈
  */
 (function () {
   "use strict";
@@ -209,8 +215,9 @@
   }
 }
 #cas-backdrop{position:fixed;inset:0;z-index:2147483646;background:transparent}
-#cas-card{position:fixed;top:64px;right:16px;z-index:2147483647;width:340px;background:var(--cas-bg);
-  color:var(--cas-fg);border:1px solid var(--cas-border);border-radius:14px;box-shadow:var(--cas-shadow);overflow:hidden}
+#cas-card{position:fixed;top:64px;right:16px;z-index:2147483647;width:380px;background:var(--cas-bg);
+  color:var(--cas-fg);border:1px solid var(--cas-border);border-radius:16px;box-shadow:var(--cas-shadow);overflow:hidden}
+#cas-card.is-drop{outline:2px dashed var(--cas-accent);outline-offset:-8px}
 #cas-head{display:flex;align-items:center;justify-content:space-between;gap:8px;
   padding:12px 14px;border-bottom:1px solid var(--cas-border)}
 #cas-title{font-size:14px;font-weight:700}
@@ -219,7 +226,12 @@
 #cas-close{border:0;background:none;color:var(--cas-muted);font-size:20px;line-height:1;
   cursor:pointer;padding:2px 8px;border-radius:6px;font-family:inherit;flex:none}
 #cas-close:hover{color:var(--cas-fg);background:var(--cas-chip)}
-#cas-list{max-height:280px;overflow-y:auto;padding:6px}
+#cas-tools{padding:8px 12px 0}
+#cas-search{width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid var(--cas-border);
+  border-radius:9px;background:var(--cas-chip);color:var(--cas-fg);font:12px/1.5 inherit}
+#cas-search:focus{outline:none;border-color:var(--cas-accent)}
+#cas-list{max-height:min(52vh,420px);overflow-y:auto;padding:6px}
+.cas-btn.is-done{border-color:var(--cas-accent);color:var(--cas-accent)}
 .cas-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px}
 .cas-row:hover{background:var(--cas-chip)}
 .cas-row.is-active{background:var(--cas-accent-soft)}
@@ -237,7 +249,8 @@
 .cas-btn-primary:hover{background:var(--cas-accent);filter:brightness(1.08)}
 .cas-btn-del:hover{border-color:var(--cas-danger);color:var(--cas-danger)}
 .cas-btn-del.is-armed{background:var(--cas-danger);border-color:var(--cas-danger);color:#fff}
-.cas-empty{color:var(--cas-muted);padding:14px 12px;line-height:1.7}
+.cas-empty{color:var(--cas-muted);padding:18px 14px;line-height:1.8;font-size:12.5px}
+.cas-empty b{color:var(--cas-fg);font-weight:600}
 #cas-foot{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--cas-border)}
 #cas-import-view{display:none;padding:10px 12px;border-top:1px solid var(--cas-border)}
 #cas-import-view.is-open{display:block}
@@ -446,7 +459,8 @@
       toast("JSON 里找不到可导入的账号:账号对象需含 sessionToken / refresh_token / access_token 任一字段");
       return null;
     }
-    let n = 0, missingSt = 0;
+    const before = getAccounts();
+    let n = 0, added = 0, updated = 0, missingSt = 0;
     const imported = [];
     for (const f of found) {
       const email = f.email ||
@@ -454,6 +468,7 @@
         (f.hint && f.hint.includes("@") ? f.hint : "");
       // 主键:邮箱 > 名称 > 父级 key(兼容本脚本备份的 name→账号映射)> account_id
       const key = f.email || f.name || f.hint || f.accountId || "acct-" + Date.now() + "-" + n;
+      if (before[key]) updated++; else added++;
       upsertAccount(key, {
         st: f.st, refreshToken: f.refreshToken, accessToken: f.accessToken,
         platform: f.platform, email, accountId: f.accountId, addedAt: f.addedAt,
@@ -465,10 +480,10 @@
     // 导入后自愈:若当前浏览器登录态正好是其中之一,直接用真实 ST 覆盖导入值
     // (导入的 ST 常是旧快照/滚动过期,当前 cookie 才是权威;不阻塞导入 toast)
     refreshCurrentSt(imported);
-    toast("已导入 " + n + " 个账号" +
-      (missingSt ? "(其中 " + missingSt + " 个缺 ST:网页切换需 ST,登录该账号后点「保存当前账号」补齐)" : ""));
+    toast("导入完成:新增 " + added + " 个,更新 " + updated + " 个" +
+      (missingSt ? "(" + missingSt + " 个缺 ST:网页切换需 ST,登录该账号后点「保存当前账号」补齐)" : ""));
     refreshPanel();
-    return n;
+    return { total: n, added: added, updated: updated, missingSt: missingSt };
   }
 
   function importJson(text) {
@@ -599,29 +614,75 @@
     if (getActive() === name) setActive(null);
   }
 
+  // 按钮短暂反馈,避免用户不确定是否点到了
+  function flashDone(btn, text) {
+    if (!btn) return;
+    const old = btn.textContent;
+    btn.textContent = text || "已复制";
+    btn.classList.add("is-done");
+    setTimeout(() => { btn.textContent = old; btn.classList.remove("is-done"); }, 1200);
+  }
+
   async function copyToken(name) {
     const acct = getAccounts()[name];
-    if (!acct) { toast("没有这个账号:" + name); return; }
+    if (!acct) { toast("没有这个账号:" + name); return false; }
     const lines = [];
     if (acct.accessToken) lines.push("access_token: " + acct.accessToken);
     if (acct.refreshToken) lines.push("refresh_token: " + acct.refreshToken);
-    if (!lines.length) { toast("该账号没有可复制的 token"); return; }
+    if (!lines.length) { toast("该账号没有可复制的 token"); return false; }
     const text = lines.join("\n");
     try {
       await navigator.clipboard.writeText(text);
       toast("已复制 " + name + " 的 token(含明文凭证,注意保管)");
+      return true;
     } catch (e) {
       prompt("剪贴板不可用,请手动复制:", text);
+      return false;
     }
   }
 
+  // ---- 备份 ----
+  const BACKUP_VERSION = 2;
+  function buildBackupPayload(all) {
+    const accounts = all || getAccounts();
+    return JSON.stringify({
+      app: "chatgpt-account-switcher",
+      version: BACKUP_VERSION,
+      exportedAt: new Date().toISOString(),
+      count: Object.keys(accounts).length,
+      accounts,
+    }, null, 2);
+  }
+  // 文件名带本地时间,多次导出不会互相覆盖
+  function backupFileName(d) {
+    const t = d || new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    return "chatgpt-accounts-" + t.getFullYear() + p2(t.getMonth() + 1) + p2(t.getDate()) +
+      "-" + p2(t.getHours()) + p2(t.getMinutes()) + ".json";
+  }
+  function downloadText(name, text) {
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function exportBackupToFile() {
+    const all = getAccounts();
+    if (!Object.keys(all).length) { toast("还没有账号可备份"); return null; }
+    const payload = buildBackupPayload(all);
+    downloadText(backupFileName(), payload);
+    toast("已导出备份文件(" + Object.keys(all).length + " 个账号,含明文 ST,注意保管)");
+    return { name: backupFileName(), payload };
+  }
   async function exportBackup() {
     const all = getAccounts();
     if (!Object.keys(all).length) { toast("还没有账号可备份"); return; }
-    const payload = JSON.stringify(
-      { app: "chatgpt-account-switcher", version: 1, exportedAt: new Date().toISOString(), accounts: all },
-      null, 2,
-    );
+    const payload = buildBackupPayload(all);
     try {
       await navigator.clipboard.writeText(payload);
       toast("备份 JSON 已复制到剪贴板(含明文 ST,注意保管)");
@@ -870,6 +931,12 @@
     if (p) p.remove();
   }
 
+  function filterNames(names, q) {
+    const t = String(q || "").trim().toLowerCase();
+    if (!t) return names;
+    return names.filter((n) => String(n).toLowerCase().indexOf(t) >= 0);
+  }
+
   function buildRow(name, acct, isActive) {
     const row = el("div", "cas-row" + (isActive ? " is-active" : ""));
     row.appendChild(el("span", "cas-dot" + (isActive ? " is-on" : "")));
@@ -903,7 +970,7 @@
       btnCopy.dataset.act = "copy";
       btnCopy.dataset.name = name;
       btnCopy.title = "复制 access_token / refresh_token,可直接用于 API/Codex 侧";
-      btnCopy.onclick = () => copyToken(name);
+      btnCopy.onclick = async () => { if (await copyToken(name)) flashDone(btnCopy); };
       row.appendChild(btnCopy);
     }
     // 该行账号的 accessToken(有存货则用它)生成 Plus 支付链;无存货则回退当前登录态
@@ -949,9 +1016,10 @@
           '<div><div id="cas-title">账号切换</div><div id="cas-sub"></div></div>' +
           '<button id="cas-close" title="关闭 (Esc)">×</button>' +
         "</div>" +
+        '<div id="cas-tools"><input id="cas-search" type="search" placeholder="搜索账号…" autocomplete="off"></div>' +
         '<div id="cas-list"></div>' +
         '<div id="cas-import-view">' +
-          '<textarea id="cas-import-text" placeholder="粘贴会话 JSON 或裸 sessionToken&#10;支持任意结构:账号对象含 sessionToken / refresh_token / access_token 任一字段即可&#10;兼容本脚本「备份」及 sub2api / CLIProxyAPI 等导出(可含多个账号)"></textarea>' +
+          '<textarea id="cas-import-text" placeholder="粘贴会话 JSON 或裸 sessionToken(也可直接把文件拖进面板)&#10;账号对象含 sessionToken / refresh_token / access_token 任一字段即可&#10;兼容本脚本「备份」及 sub2api / CLIProxyAPI 等导出,可含多个账号"></textarea>' +
           '<div id="cas-import-actions">' +
             '<button id="cas-import-file-btn" class="cas-btn">选择文件…</button>' +
             '<button id="cas-import-ok" class="cas-btn cas-btn-primary">确认导入</button>' +
@@ -979,7 +1047,7 @@
         '<div id="cas-foot">' +
           '<button id="cas-capture" class="cas-btn">保存当前账号</button>' +
           '<button id="cas-import" class="cas-btn">导入</button>' +
-          '<button id="cas-export" class="cas-btn">备份</button>' +
+          '<button id="cas-export" class="cas-btn">导出文件</button>' +
           '<button id="cas-sub" class="cas-btn cas-btn-primary">订阅 Plus</button>' +
          "</div>" +
        "</div>";
@@ -991,17 +1059,35 @@
       ? "当前:" + active
       : "未跟踪登录态(切换或捕获后显示)";
     const list = wrap.querySelector("#cas-list");
+    const searchBox = wrap.querySelector("#cas-search");
     const names = Object.keys(all).sort();
-    if (!names.length) {
-      list.appendChild(el("div", "cas-empty", "还没有账号:点「保存当前账号」捕获当前登录,或「导入」粘贴 JSON / ST"));
-    } else {
-      for (const n of names) list.appendChild(buildRow(n, all[n], n === active));
+    if (searchBox) searchBox.style.display = names.length > 1 ? "" : "none";
+
+    // 重新渲染列表(搜索过滤走这个口);innerHTML="" 清空,真实 DOM 与测试垫片行为一致
+    function renderList(q) {
+      list.innerHTML = "";
+      const shown = filterNames(names, q);
+      if (!names.length) {
+        const e = el("div", "cas-empty");
+        e.appendChild(el("b", "", "还没有账号"));
+        list.appendChild(e);
+        list.appendChild(el("div", "cas-empty", "点「保存当前账号」捕获当前登录,或「导入」粘贴 JSON / 会话令牌"));
+        return shown;
+      }
+      if (!shown.length) {
+        list.appendChild(el("div", "cas-empty", "没有匹配「" + String(q).trim() + "」的账号"));
+        return shown;
+      }
+      for (const n of shown) list.appendChild(buildRow(n, all[n], n === active));
+      return shown;
     }
+    renderList("");
+    if (searchBox) searchBox.oninput = () => renderList(searchBox.value);
 
     wrap.querySelector("#cas-close").onclick = closePanel;
     wrap.querySelector("#cas-backdrop").onclick = closePanel;
     wrap.querySelector("#cas-capture").onclick = () => captureCurrent().then(refreshPanel);
-    wrap.querySelector("#cas-export").onclick = exportBackup;
+    wrap.querySelector("#cas-export").onclick = exportBackupToFile;
 
     const importView = wrap.querySelector("#cas-import-view");
     const showImport = (show) => {
@@ -1012,18 +1098,21 @@
     wrap.querySelector("#cas-import-cancel").onclick = () => showImport(false);
     const fileInput = wrap.querySelector("#cas-import-file");
     wrap.querySelector("#cas-import-file-btn").onclick = () => fileInput.click();
+
+    // 文件导入:按钮选择与拖放共用,任一文件成功就收起导入区
+    const importFiles = (files) => Promise.all(files.map((f) =>
+      f.text()
+        .then((txt) => { const r = importJson(txt); return r !== null && r !== undefined; })
+        .catch(() => { toast("读取文件失败:" + f.name); return false; }),
+    )).then((rs) => { if (rs.some(Boolean)) showImport(false); });
+
     fileInput.onchange = () => {
       const files = Array.from(fileInput.files || []);
       fileInput.value = ""; // 清空以便下次可重复选择同一文件
-      if (!files.length) return;
-      let ok = 0;
-      Promise.all(files.map((f) =>
-        f.text()
-          .then((txt) => { const r = importJson(txt); if (r !== null && r !== undefined) ok++; })
-          .catch(() => toast("读取文件失败:" + f.name)),
-      )).then(() => { if (ok) showImport(false); });
+      if (files.length) importFiles(files);
     };
-    wrap.querySelector("#cas-import-ok").onclick = () => {
+
+    const submitImport = () => {
       const r = importJson(wrap.querySelector("#cas-import-text").value);
       if (r !== null && r !== undefined) {
         wrap.querySelector("#cas-import-text").value = "";
@@ -1031,6 +1120,23 @@
         refreshPanel();
       }
     };
+    wrap.querySelector("#cas-import-ok").onclick = submitImport;
+    wrap.querySelector("#cas-import-text").onkeydown = (e) => {
+      if (e && e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitImport();
+    };
+
+    // 拖放:文件直接丢到面板上即可导入
+    const card = wrap.querySelector("#cas-card");
+    if (card) {
+      card.ondragover = (e) => { if (e && e.preventDefault) e.preventDefault(); card.classList.add("is-drop"); };
+      card.ondragleave = () => card.classList.remove("is-drop");
+      card.ondrop = (e) => {
+        if (e && e.preventDefault) e.preventDefault();
+        card.classList.remove("is-drop");
+        const files = Array.from((e && e.dataTransfer && e.dataTransfer.files) || []);
+        if (files.length) importFiles(files);
+      };
+    }
     if (opts && opts.import) showImport(true);
 
     // ---- 订阅视图:预设区按钮 + 自定义 country/currency + 结果三连(复制/新标签/直跳) ----
@@ -1199,6 +1305,7 @@
       GM_registerMenuCommand("🔁 账号面板" + (email ? "(" + email + ")" : ""), () => panel());
       GM_registerMenuCommand("👤 保存当前登录账号", () => captureCurrent().then(refreshPanel));
       GM_registerMenuCommand("📥 导入账号(JSON / ST)", () => panel({ import: true }));
+      GM_registerMenuCommand("💾 导出备份到文件(JSON)", exportBackupToFile);
       GM_registerMenuCommand("📤 导出备份(复制 JSON)", exportBackup);
       GM_registerMenuCommand("💳 订阅 Plus(菲律宾 PHP 一键直达)", () => panel({ sub: true }));
       GM_registerMenuCommand("🫥 显示/隐藏悬浮球", () => {
@@ -1223,6 +1330,7 @@
       fragmentFromClientSecret, extractSessionIdFromAnyUrl, SUB_PRESETS,
       postCheckout, stripeFetch, buildStripeInitBody,
       parseSession, sessionMatchesAcct,
+      buildBackupPayload, backupFileName, exportBackupToFile, filterNames, importAccountsJson, downloadText,
       accounts: getAccounts, active: getActive, session: fetchSession, panel,
     };
   }
