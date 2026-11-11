@@ -2,7 +2,7 @@
 
 - Spec approval: **obtained from user**（2026-10-28, 选项「批准,开始实现」;之后 R1–R3 为 append-only 修订,行为收窄而非扩大,未重新请批 —— 见 Honest notes）
 - Source state: 见 `tools/source-state.sh`（commit + 工作树干净判定 + userscript sha256）
-- Toolchain: Node **v26.12.0**;零新依赖（`node:test` / `node:assert` / `node:vm` / V8 coverage 全部内置）
+- Toolchain: Node **v26.13.0**;零新依赖（`node:test` / `node:assert` / `node:vm` / V8 coverage 全部内置）。注:本次会话中运行时由 v26.12.0 升至 v26.13.0,下述"最终一次全新跑"在 v26.13.0 上执行
 - Entry point: `tools/gauntlet.sh 412d59e`
 - Independent verification: **not performed**（Tier 2;用户未要求,成本不必要）
 
@@ -36,7 +36,7 @@
 | Layer | Command | Result |
 |---|---|---|
 | L1 Syntax | `node --check chatgpt-account-switcher.user.js` | OK |
-| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **17 passed, 0 failed**, duration 3293.3ms |
+| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **17 passed, 0 failed**, duration 3271.6ms |
 | L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 102, executable **102**, non-code 0 → **102/102 covered** |
 | L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**9/9 killed** |
 | L5 Determinism | 第二次完整跑 L2 | OK（SUBSTITUTED,见下） |
