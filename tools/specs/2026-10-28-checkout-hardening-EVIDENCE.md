@@ -27,15 +27,18 @@
 | Must NOT: accessToken 不落盘 | 无新增 GM_setValue 存储凭证的路径 | n-a（代码走查,无自动化层） |
 | Property P1: 50 个随机非 stripe host 全拒 | tools/run-tests.mjs::"P1 …" | pass |
 | Property P2: 长链成功 external/internal host 不变量 ×5 | tools/run-tests.mjs::"P2 …" | pass |
+| V1 删旧 cookie 失败 → 中止不写新 ST | tools/run-tests.mjs::"V1 …" | pass |
+| V2 服务端拒绝会话 → 不 reload 并说明 | tools/run-tests.mjs::"V2 …" | pass |
+| V3 服务端认了 → 置 active 并 reload（回归护甲） | tools/run-tests.mjs::"V3 …" | pass |
 
 ## Gauntlet (final fresh run, `tools/gauntlet.sh 412d59e`)
 
 | Layer | Command | Result |
 |---|---|---|
 | L1 Syntax | `node --check chatgpt-account-switcher.user.js` | OK |
-| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **14 passed, 0 failed**, duration 3349.6ms |
-| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 60, executable **60**, non-code 0 → **60/60 covered** |
-| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**6/6 killed** |
+| L2 Tests | `node --test --test-timeout=10000 tools/run-tests.mjs` | **17 passed, 0 failed**, duration 3293.3ms |
+| L3 Changed-line coverage | `node tools/coverage-changed.mjs 412d59e` | changed 102, executable **102**, non-code 0 → **102/102 covered** |
+| L4 Mutation | `node tools/mutate.mjs` | negative control 0 replacements;**9/9 killed** |
 | L5 Determinism | 第二次完整跑 L2 | OK（SUBSTITUTED,见下） |
 | Real execution | vm 沙箱加载真实 userscript,panel/capture/checkout→stripe 全链 mock 跑通 | L2 全部测试即此证据;真实网络未打（无登录态） |
 | Supply chain | 依赖集未变 | 0 new deps;无 npm audit 对象 |
@@ -47,6 +50,9 @@
 - M4 Accept-Language q 值反转 → killed（S7）
 - M5 冷却时差反转 → killed（S9）
 - M6 Stripe host 重写判定反转 → killed（S5/P2）
+- M7 删除失败中止判定反转 → killed（V1）
+- M8 服务端拒绝时不阻断刷新 → killed（V2）
+- M9 切换成功后不 reload → killed（V3）
 
 Checker 负向对照:
 - `mutate.mjs`: 缺失定位串 → 替换计数必须为 0 的守卫路径实际执行（输出 "negative control: absent-marker → 0 replacements"）;定位串出现次数 ≠1 时 exit 1。
@@ -70,3 +76,4 @@ Checker 负向对照:
 - SPEC 三次 append 修订:R1（S2 真实契约是「未登录」非「字段缺失」）;R2/R3（S4 main 终态分支不调 setActive,断言 ===null 改为 falsy）。均为实现揭示的预期错误,非测试失败后的让步。
 - 早先版本的一个候选 mutant（stripeInit 状态码校验取反）实测存活,判定为**等价 mutant**:成功时抛错与网络失败对回退逻辑不可区分且回退链有效;已用 M6（host 重写）替换,未加无意义测试。
 - `example.json` 含真实明文凭证,仍未纳入 git（untracked）,不提交。
+- 2026-11-11 追加（v1.7.1）：用户报「ST 切换后立刻掉登录」。解码两份真实 session 后确认 `exp-iat` 恒为 864000s=**10 天**（脚本原注释写 30 天,已修正）;其中旧 `example.json` 的 access_token 已过期 10.0 天。V1–V3 覆盖的是脚本侧能确定的失败模式（删 cookie 静默失败导致 ST 被写坏、切完不校验就刷新）。**服务端按设备/出口 IP 吊销会话这一可能性无法在沙箱内验证**,属已知边界。

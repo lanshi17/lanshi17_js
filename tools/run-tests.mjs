@@ -213,3 +213,50 @@ test("P2 round-trip: 长链成功时 external=pay.openai.com,internal=chatgpt.co
     assert.ok(urls.internal.startsWith("https://chatgpt.com/checkout/"));
   }
 });
+
+// ---------- V1-V3:切换健壮性(ACP 审计:静默删错 + 切完不校验) ----------
+const targetAcct = { st: "NEW-ST-VALUE", email: "a@b.com", accountId: "WANT" };
+
+test("V1 applySwitch: 删旧 cookie 失败 → 中止,不写入新 ST", async () => {
+  const sb = createSandbox(SCRIPT, {
+    cookies: ST_COOKIE,
+    gmValues: { cas_accounts: { "a@b.com": targetAcct } },
+  });
+  await waitFor(() => sb.gmGetValue("cas_invalid") === false); // 等 main 跑完
+  sb.setDeleteFail(() => true);
+  const ok = await sb.cas.applySwitch("a@b.com");
+  assert.equal(ok, false);
+  assert.equal(sb.cookieNames().length, 1);
+  assert.equal(sb.cookies()[0].value, "ST-JWT"); // 旧值原样,没被写新
+  assert.ok(sb.toastTexts().some((t) => t.includes("删除")));
+});
+
+test("V2 switchTo: 服务端没认目标账号 → 不 reload,给出明确原因", async () => {
+  let sess = null;
+  const sb = createSandbox(SCRIPT, {
+    cookies: ST_COOKIE,
+    gmValues: { cas_accounts: { "a@b.com": targetAcct } },
+    sessionHandler: () => sess,
+  });
+  await waitFor(() => sb.gmGetValue("cas_invalid") === false);
+  sess = { account: { id: "OTHER" }, user: { id: "u", email: "other@x.com" } }; // 写入后服务端返回别的号
+  const ok = await sb.cas.switchTo("a@b.com");
+  assert.equal(ok, false);
+  assert.equal(sb.reloadCount(), 0);
+  assert.ok(sb.toastTexts().some((t) => t.includes("拒绝")));
+});
+
+test("V3 switchTo: 服务端认了 → 标记 active 并 reload", async () => {
+  let sess = null;
+  const sb = createSandbox(SCRIPT, {
+    cookies: ST_COOKIE,
+    gmValues: { cas_accounts: { "a@b.com": targetAcct } },
+    sessionHandler: () => sess,
+  });
+  await waitFor(() => sb.gmGetValue("cas_invalid") === false);
+  sess = { account: { id: "WANT" }, user: { id: "u", email: "a@b.com" } };
+  const ok = await sb.cas.switchTo("a@b.com");
+  assert.equal(ok, true);
+  assert.equal(sb.reloadCount(), 1);
+  assert.equal(sb.gmGetValue("cas_active"), "a@b.com");
+});

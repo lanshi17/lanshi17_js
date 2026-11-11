@@ -32,6 +32,15 @@ const MUTANTS = [
   { id: "M6", desc: "Stripe host 重写判定反转(不重写为 pay.openai.com)",
     old: 'const external = hosted.indexOf("checkout.stripe.com") >= 0',
     now: 'const external = hosted.indexOf("checkout.stripe.com") < 0' },
+  { id: "M7", desc: "删除失败中止判定反转(静默吞错回归)",
+    old: 'if (failed.length) {',
+    now: 'if (!failed.length) {' },
+  { id: "M8", desc: "服务端拒绝时不阻断刷新(校验形同虚设)",
+    old: 'if (verdict === false) {',
+    now: 'if (verdict === true) {' },
+  { id: "M9", desc: "切换成功后不 reload(V3 回归护甲)",
+    old: 'location.reload(); // 换 cookie 后必须刷新,页面才会以新身份重建',
+    now: '; // 换 cookie 后必须刷新,页面才会以新身份重建' },
 ];
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");

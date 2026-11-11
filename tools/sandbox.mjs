@@ -119,6 +119,7 @@ export function createSandbox(scriptPath, opts = {}) {
   let checkoutHandler = opts.checkoutHandler || null;
   let xhrHandler = opts.xhrHandler || null;
   let cookies = opts.cookies ? opts.cookies.map((c) => ({ ...c })) : [];
+  let deleteFail = () => false;
 
   const htmlRoot = makeElement("html");
   const head = makeElement("head");
@@ -138,7 +139,8 @@ export function createSandbox(scriptPath, opts = {}) {
     languages: opts.navigatorLanguages || ["zh-CN"],
     clipboard: { writeText: () => Promise.resolve() },
   };
-  const locationShim = { hostname: "chatgpt.com", href: "https://chatgpt.com/", reload: () => {} };
+  let reloadCount = 0;
+  const locationShim = { hostname: "chatgpt.com", href: "https://chatgpt.com/", reload: () => { reloadCount++; } };
 
   function jsonResponse(data, status = 200) {
     const text = data === undefined ? "" : JSON.stringify(data);
@@ -195,6 +197,7 @@ export function createSandbox(scriptPath, opts = {}) {
       list: (_d, cb) => cb(cookies.map((c) => ({ ...c }))),
       set: (details, cb) => { cookies.push({ ...details }); cb(); },
       delete: (details, cb) => {
+        if (deleteFail(details.name)) { cb(new Error("delete denied by test")); return; }
         cookies = cookies.filter((c) => !(c.name === details.name && c.domain === (details.domain || "chatgpt.com")));
         cb();
       },
@@ -222,6 +225,10 @@ export function createSandbox(scriptPath, opts = {}) {
     setSessionHandler: (fn) => { sessionHandler = fn; },
     setCheckoutHandler: (fn) => { checkoutHandler = fn; },
     setXhrHandler: (fn) => { xhrHandler = fn; },
+    setDeleteFail: (fn) => { deleteFail = fn; },
+    cookieNames: () => cookies.map((c) => c.name),
+    cookies: () => cookies.map((c) => ({ ...c })),
+    reloadCount: () => reloadCount,
     setNavigator: (language, languages) => {
       navigatorShim.language = language;
       navigatorShim.languages = languages || [language];

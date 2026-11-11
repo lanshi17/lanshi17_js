@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 多账号一键切换(本地 ST)
 // @namespace    codex-plus
-// @version      1.7.0
+// @version      1.7.1
 // @description  在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球/菜单一键切换,支持备份导入导出。新增 Plus 订阅支付链一键生成(菲律宾 PHP 置顶,Stripe init 三步长链,可直跳 pay.openai.com 支付页)。原理:网页登录态 = HttpOnly cookie `__Secure-next-auth.session-token`,用 GM_cookie 删旧写新后刷新。需要 Tampermonkey(GM_cookie 仅 TM 支持)。导入支持任意结构 JSON:账号对象含 sessionToken / refresh_token / access_token 任一字段即可识别。
 // @author       codex_plus
 // @match        https://chatgpt.com/*
@@ -20,7 +20,8 @@
  * 安全须知:
  * - ST 是账号钥匙,明文存在 Tampermonkey 脚本存储里(仅本机本浏览器)。勿导出分享;「备份」导出的 JSON 同样含明文 ST。
  * - 在 chatgpt.com 执行“登出所有设备”会使所有已存 ST 全部失效。
- * - ST 过期(约 30 天滚动)后需在该账号登录状态下点“保存当前账号”重新捕获。
+ * - ST 的 access_token 声明 exp-iat 实测固定 10 天(session 记录 90 天);过期后需在该账号登录状态下点“保存当前账号”重新捕获。
+ *   服务端还可能因设备/出口 IP 变化提前吊销,切换后如被弹回登录页即为该情况。
  * - 本脚本只读写你自己的会话 cookie,不外发任何数据。
  *
  * v1.1.0
@@ -67,6 +68,13 @@
  *   checkout Accept-Language 跟随 navigator.languages(此前硬编码 zh-CN,与 IP/UA 矛盾是风控特征)
  * - checkout 30s 超时(可注入),挂起不再永久 busy;订阅 15s 冷却落 store,关面板重开仍生效
  * - stripeFetch 白名单改用 URL 解析:校验 https + 精确 host + 规范化 pathname,拦路径穿越
+ *
+ * v1.7.1(切换健壮性)
+ * - 删旧 cookie 失败不再静默吞错:直接中止、不写新 ST。此前残留旧分块会被 readCurrentSt 拼成垃圾串,
+ *   再由自愈流程覆盖已存 ST,导致该账号之后每次切换都秒退且无法自愈
+ * - 切换后先向 /api/auth/session 校验服务端是否真的认这个会话;明确被拒则不刷新页面并说明原因
+ *   (刷新只会把人弹到登录页、把原因冲掉);校验本身异常时不拦,照常刷新
+ * - 修正 ST 有效期说明:access_token 的 exp-iat 实测固定 10 天,不是 30 天
  */
 (function () {
   "use strict";
@@ -487,10 +495,17 @@
     if (!acct.st) { toast("「" + name + "」缺 ST(网页会话凭证),无法切换;请登录该账号后点「保存当前账号」补齐"); return false; }
 
     try {
-      // 1) 删除现有会话 cookie(含历史分块,防止旧块残留导致重组损坏)
+      // 1) 删除现有会话 cookie(含历史分块)。删除失败必须中止:
+      //    残留旧块 + 新值会让 readCurrentSt 拼出垃圾串,进而把该账号已存 ST 永久写坏
       const cookies = (await gmList().catch(() => [])).filter(isSessionCookie);
+      const failed = [];
       for (const c of cookies) {
-        await gmDelete({ name: c.name, domain: c.domain || location.hostname }).catch(() => {});
+        try { await gmDelete({ name: c.name, domain: c.domain || location.hostname }); }
+        catch (e) { failed.push(c.name); }
+      }
+      if (failed.length) {
+        toast("切换中止:旧会话 cookie 删除失败(" + failed.join(",") + "),未写入新 ST。请手动清除该站 cookie 后重试");
+        return false;
       }
       // 2) 写入新 ST(超长分块);写入失败必须可见,不能默默烂在半路
       const parts = chunkSt(acct.st);
@@ -508,14 +523,35 @@
       toast("切换失败:" + ((e && e.message) || e));
       return false;
     }
-    setActive(name);
     return true;
+  }
+
+  // 换 cookie 后确认服务端真的认这个会话。
+  // true=认;false=明确拒绝(未登录或换了别的号);null=无法判断(网络/解析异常,不拦)
+  async function verifySession(acct) {
+    try {
+      const r = await fetch("/api/auth/session", { credentials: "same-origin", cache: "no-store" });
+      if (!r.ok) return false;
+      const p = parseSession(await r.json());
+      if (!p) return false; // 未登录 = 这个 ST 被拒
+      return (!!p.email && p.email === acct.email) || (!!p.accountId && p.accountId === acct.accountId);
+    } catch (e) {
+      return null;
+    }
   }
 
   async function switchTo(name) {
     const ok = await applySwitch(name);
-    if (ok) location.reload(); // 换 cookie 后必须刷新,页面才会以新身份重建
-    return ok;
+    if (!ok) return false;
+    const verdict = await verifySession(getAccounts()[name] || {});
+    if (verdict === false) {
+      // 不 reload:刷新只会把用户弹到登录页并把原因冲掉
+      toast("已写入 ST,但服务端拒绝了这个会话(ST 过期/被吊销/cookie 已不再使用);未刷新页面,请重新捕获后再试");
+      return false;
+    }
+    setActive(name);
+    location.reload(); // 换 cookie 后必须刷新,页面才会以新身份重建
+    return true;
   }
 
   function removeAccount(name) {
