@@ -6,6 +6,29 @@ Tampermonkey(油猴)用户脚本集合。GitHub:https://github.com/lanshi17 有a
 1. 仅在湖南农业大学的高级算法设计课程作业通过测试
 2. 如果有补充欢迎联系!
 
+## ChatGPT Plus 一键充值(chatgpt-plus-pay.user.js)
+
+只做一件事:粘贴 Session JSON → 选地区 → 拿 pay.openai.com 支付链。
+不切换账号、不读写 cookie、不需要 ST 有效,只用 `accessToken`(10 天有效期)。
+
+### 安装
+通过 raw 链接安装:https://raw.githubusercontent.com/lanshi17/lanshi17_js/master/chatgpt-plus-pay.user.js
+
+### 使用步骤
+1. 登录目标 ChatGPT 账号,打开 `chatgpt.com/api/auth/session`,全选复制 JSON
+2. 点页面右下角 💳 悬浮按钮打开面板
+3. 把 JSON 粘贴进输入框
+4. 点「🇵🇭 菲律宾 · PHP」(最便宜)——或选其他地区
+5. 等 2–5 秒拿到 pay.openai.com 长链,复制后在干净浏览器里打开支付
+
+### 注意
+- `accessToken` 有效期 **10 天**,过期需重新粘贴新 JSON
+- 每次生成会使同账号旧链失效,生成后当天完成支付
+- 出口 IP 尽量与所选国家一致(PH 链走菲律宾节点最稳)
+- OpenAI 有风控,切勿连点;15 秒冷却后再试
+
+---
+
 ## ChatGPT 多账号一键切换(chatgpt-account-switcher.user.js)
 
 在 chatgpt.com 保存多个账号的 sessionToken(ST),悬浮球 / 油猴菜单一键切换,支持备份导入导出。
